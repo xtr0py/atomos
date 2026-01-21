@@ -2,12 +2,16 @@
 
 A lightweight, regex‑based quote extraction tool with a Streamlit review UI and JSONL append‑only storage.
 
-This project is designed to:
+---
 
-* Extract quotes from messy text sources (news, transcripts, quote dumps, tables, etc.)
-* Infer speakers/authors when possible
-* Let a human quickly review, edit, tag, and approve quotes
-* Append clean `{text, author, tags[]}` records to a growing JSONL dataset
+## Key Features
+
+- **Finds quotes automatically** from articles, transcripts, and pasted text (handles smart quotes and nested quotes)  
+- **Figures out who said each quote** using nearby context like “Name said” and by carrying the speaker forward within a paragraph  
+- **Extracts quotes from transcripts and lists** (lines like `HOST: text`, numbered lists, and pages with repeated quotes and authors)  
+- **Lets you review and edit everything by hand** in a clean web interface before saving  
+- **Prevents duplicates automatically** by detecting quotes that already exist in your dataset  
+- **Saves clean, structured data** as append-only JSONL (`text`, `author`, `tags`) ready for analysis or training 
 
 ---
 
@@ -71,19 +75,6 @@ streamlit run app.py
 
 ---
 
-## Features
-
-* Extracts quoted spans (supports smart quotes + nesting)
-* Transcript speaker labels (`HOST: text`)
-* Quote lists with author carry‑forward (Goodreads / numbered lists)
-* Table / TSV row extraction
-* Heuristic speaker attribution (`Name said …` before/after quotes)
-* Paragraph‑level carry‑forward of speakers
-* Human‑in‑the‑loop review UI
-* Append‑only JSONL output with deduplication
-
----
-
 ## Output format (JSONL)
 
 Each approved quote is written as one JSON object per line:
@@ -91,14 +82,3 @@ Each approved quote is written as one JSON object per line:
 ```json
 {"text": "The only limit to our realization of tomorrow is our doubts of today.", "author": "Franklin D. Roosevelt", "tags": ["inspiration", "future"]}
 ```
-
----
-
-## Notes
-
-* `max_len` is intentionally fixed at 240 characters by design.
-* The parser is regex‑based and heuristic: accuracy improves with human review.
-* `parser_core.py` and `app.py` are intentionally kept separate for easier debugging and benchmarking.
-
----
-
