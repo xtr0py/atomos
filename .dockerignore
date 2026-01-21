@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+ENV/
+
+# Streamlit
+.streamlit/
+
+# Data / outputs
+/data/
+*.jsonl
+*.csv
+
+# Jupyter / misc
+.ipynb_checkpoints/
+
+# Git
+.git/
+.gitignore
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
