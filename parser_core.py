@@ -27,19 +27,26 @@ def normalize_key(text: str) -> str:
     t = normalize_ws(text).lower().strip(" \t\r\n\"'“”‘’")
     return _WS_MULTI_RE.sub(" ", t)
 
+_DEDUPE_RE = re.compile(r"[\s\"“”‘’'`]+")
+def dedupe_key(s: str) -> str:
+    s = normalize_ws(s).lower()
+    s = _DEDUPE_RE.sub(" ", s)
+    return s.strip(" .,!?:;()-")
+
 def sentence_count_upto(text: str, limit: int) -> int:
     """
-    Count sentences but stop once we exceed `limit`.
+    Count sentence-ending punctuation groups.
+    Returns at least 1 for non-empty text.
     """
     t = text.strip()
     if not t:
         return 0
-    count = 1
+    count = 0
     for _ in _SENT_SPLIT_RE.finditer(t):
         count += 1
         if count > limit:
             return count
-    return count
+    return max(1, count)
 
 def looks_like_noise(q: str) -> bool:
     if re.search(r"https?://|www\.", q, re.IGNORECASE):
@@ -83,6 +90,16 @@ def fast_context_norm(s: str) -> str:
     s = s.replace("\n", " ")
     s = _WS_SPACES_RE.sub(" ", s)
     return s.strip()
+
+def build_line_starts(raw: str) -> List[int]:
+    """
+    Returns starting character offsets for each line in `raw`.
+    Line i begins at raw[line_starts[i]].
+    """
+    starts = [0]
+    for m in re.finditer(r"\n", raw):
+        starts.append(m.end())
+    return starts
 
 # -----------------------------
 # Patterns learned from examples
@@ -152,23 +169,33 @@ def parse_tag_line(tag_line: str) -> List[str]:
 # -----------------------------
 
 def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
+    """
+    Finds outermost quote spans for curly quotes and straight quotes.
+    Adds light heuristics to avoid pairing escaped quotes and inch marks (5").
+    """
     spans: List[Tuple[int, int]] = []
     curly_stack: List[int] = []
     straight_stack: List[int] = []
 
+    def is_escaped(i: int) -> bool:
+        return i > 0 and text[i - 1] == "\\"
+
+    def looks_like_inch_mark(i: int) -> bool:
+        return i > 0 and text[i - 1].isdigit()
+
     for i, ch in enumerate(text):
         if ch == "“":
             curly_stack.append(i)
+        elif ch == "”":
+            if curly_stack:
+                spans.append((curly_stack.pop(), i))
         elif ch == '"':
+            if is_escaped(i) or looks_like_inch_mark(i):
+                continue
             if straight_stack:
                 spans.append((straight_stack.pop(), i))
             else:
                 straight_stack.append(i)
-        elif ch == "”":
-            if curly_stack:
-                spans.append((curly_stack.pop(), i))
-            elif straight_stack:
-                spans.append((straight_stack.pop(), i))
 
     spans.sort(key=lambda x: (x[0], -x[1]))
     outer: List[Tuple[int, int]] = []
@@ -189,22 +216,43 @@ HONORIFIC_RE = re.compile(r"^(Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.)\s+", re.IGNORECASE)
 
 ATTR_VERBS = [
     "said", "says", "told", "wrote", "stated", "notes", "argued", "added", "explained",
-    "joked", "quipped", "teased", "continued", "recalled", "insisted", "admitted", "warned"
+    "joked", "quipped", "teased", "continued", "recalled", "insisted", "admitted", "warned",
+    "according to",
 ]
-ATTR_VERB_RE = "|".join(ATTR_VERBS)
+# Note: "according to" contains a space; we handle it by ordering/regex boundaries carefully below.
+# We'll build a verb pattern that treats it as an alternative phrase.
+ATTR_VERB_RE = r"(?:according to|said|says|told|wrote|stated|notes|argued|added|explained|joked|quipped|teased|continued|recalled|insisted|admitted|warned)"
+
+# Capture-safe name phrase (no nested capturing groups)
+NAME_PHRASE = rf"{NAME_TOKEN}(?:\s+{NAME_TOKEN}){{0,3}}"
+
+# Optional role/title prefix before a proper name, e.g. "German Chancellor", "Prime Minister", "Senator"
+# Keep this short to reduce false positives.
+ROLE_PREFIX = r"(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4}\s+)?"
 
 AFTER_ATTR_PATTERNS = [
-    re.compile(rf"^\s*[,–—-]?\s*({FULLNAME_RE.pattern})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
-    re.compile(rf"^\s*[,–—-]?\s*({NAME_TOKEN}(?:\s+{NAME_TOKEN}){{0,3}})\s*,[^.]*?\b(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
-    re.compile(rf"^\s*[,–—-]?\s*({NAME_TOKEN})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
-    re.compile(r"^\s*[,–—-]?\s*(their statement|the statement)\s+(continued|said)\b", re.IGNORECASE),
+    # "..., Name said"
+    re.compile(rf"^\s*[,–—-]?\s*({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
+
+    # "..., said Name"
+    re.compile(rf"^\s*[,–—-]?\s*(?:{ATTR_VERB_RE})\s+({NAME_PHRASE})\b", re.IGNORECASE),
+
+    # "..., Role Name said"
+    re.compile(rf"^\s*[,–—-]?\s*{ROLE_PREFIX}({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
+
+    # "..., Name, ... said"
+    re.compile(rf"^\s*[,–—-]?\s*({NAME_PHRASE})\s*,[^.]*?\b(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
+
+    # pronoun-ish / continuation
+    re.compile(r"^\s*[,–—-]?\s*(their statement|they said|the statement)\s+(continued|said)\b", re.IGNORECASE),
 ]
+
 BEFORE_ATTR_PATTERNS = [
-    re.compile(rf"({FULLNAME_RE.pattern})\s+(?:{ATTR_VERB_RE})[^“\"]{{0,80}}[:;,]?\s*$", re.IGNORECASE),
-    re.compile(rf"({FULLNAME_RE.pattern})\s+(?:{ATTR_VERB_RE})[^“\"]{{0,120}}[:]\s*$", re.IGNORECASE),
-    re.compile(rf"\bplea from\s+({FULLNAME_RE.pattern})\b", re.IGNORECASE),
-    re.compile(rf"\bthe plea\s+({FULLNAME_RE.pattern})\s+made\b", re.IGNORECASE),
-    re.compile(rf"\b({FULLNAME_RE.pattern})\s+telling\b", re.IGNORECASE),
+    re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“\"]{{0,80}}[:;,]?\s*$", re.IGNORECASE),
+    re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“\"]{{0,120}}[:]\s*$", re.IGNORECASE),
+    re.compile(rf"\bplea from\s+({NAME_PHRASE})\b", re.IGNORECASE),
+    re.compile(rf"\bthe plea\s+({NAME_PHRASE})\s+made\b", re.IGNORECASE),
+    re.compile(rf"\b({NAME_PHRASE})\s+telling\b", re.IGNORECASE),
 ]
 
 def extract_best_person_name(s: str) -> Optional[str]:
@@ -257,7 +305,6 @@ def resolve_author_for_quote(
     lastname_map: Optional[Dict[str, str]],
     last_known_author_in_paragraph: Optional[str],
 ) -> str:
-    # lightweight normalization for matching
     before = fast_context_norm(context_before)[-CTX_WINDOW:]
     after = fast_context_norm(context_after)[:CTX_WINDOW]
 
@@ -270,10 +317,14 @@ def resolve_author_for_quote(
         m = pat.search(after)
         if not m:
             continue
-        cand = m.group(0)
-        if re.search(r"\b(their statement|the statement)\b", cand, re.IGNORECASE):
+
+        # If the match doesn't have a usable captured name (e.g., "their statement ..."),
+        # fall back to paragraph carry/default.
+        if not (m.lastindex and m.lastindex >= 1):
             return last_known_author_in_paragraph or default_author
-        name = extract_best_person_name(cand)
+
+        name_src = m.group(1)
+        name = extract_best_person_name(name_src)
         if name:
             name = name.split(",")[0].strip()
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
@@ -284,7 +335,8 @@ def resolve_author_for_quote(
         m = pat.search(before)
         if not m:
             continue
-        name = extract_best_person_name(m.group(0))
+        name_src = m.group(1)
+        name = extract_best_person_name(name_src)
         if name:
             name = name.split(",")[0].strip()
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
@@ -326,8 +378,13 @@ def extract_unquoted_quote_lists(
     max_len: int,
     max_newlines: int,
     max_sentences: int,
+    line_starts: Optional[List[int]] = None,
 ) -> List[Dict[str, object]]:
-    lines = [normalize_ws(l) for l in text.splitlines()]
+    raw_lines = text.splitlines()
+    lines = [normalize_ws(l) for l in raw_lines]
+    if line_starts is None:
+        line_starts = build_line_starts(text)
+
     results: List[Dict[str, object]] = []
     current_author: Optional[str] = None
     last_entry_index: Optional[int] = None
@@ -366,7 +423,7 @@ def extract_unquoted_quote_lists(
             current_author = tidy_quote_text(line)
             continue
 
-        add_entry(line, current_author, pos=idx)
+        add_entry(line, current_author, pos=line_starts[idx])
 
     return results
 
@@ -390,7 +447,11 @@ def extract_table_rows(
     max_len: int,
     max_newlines: int,
     max_sentences: int,
+    line_starts: Optional[List[int]] = None,
 ) -> List[Dict[str, object]]:
+    if line_starts is None:
+        line_starts = build_line_starts(text)
+
     results: List[Dict[str, object]] = []
     for i, line in enumerate(text.splitlines()):
         if is_noise_line(line):
@@ -410,8 +471,42 @@ def extract_table_rows(
         if not cleaned:
             continue
 
-        results.append({"text": cleaned, "author": tidy_quote_text(author_field), "tags": [], "_pos": i})
+        results.append({"text": cleaned, "author": tidy_quote_text(author_field), "tags": [], "_pos": line_starts[i]})
     return results
+
+# -----------------------------
+# Inline quoted line + attribution extraction
+# -----------------------------
+
+INLINE_QUOTE_ATTR_RE = re.compile(
+    r'^\s*[“"](?P<q>.+?)[”"]\s*(?:[—–-]\s*(?P<a>[^,\n]{2,120})|[(\[]\s*(?P<a2>[^)\]\n]{2,120})\s*[)\]])\s*$'
+)
+
+def extract_inline_quote_attribution_lines(
+    raw: str,
+    *,
+    default_author: str,
+    min_len: int,
+    max_len: int,
+    max_newlines: int,
+    max_sentences: int,
+    line_starts: List[int],
+) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    for i, line in enumerate(raw.splitlines()):
+        if is_noise_line(line):
+            continue
+        if GOODREADS_TAGS_RE.match(line.strip()):
+            continue
+        m = INLINE_QUOTE_ATTR_RE.match(line)
+        if not m:
+            continue
+        qt = clamp_minimal(m.group("q"), min_len, max_len, max_newlines, max_sentences)
+        if not qt:
+            continue
+        author = tidy_quote_text(m.group("a") or m.group("a2") or default_author)
+        out.append({"text": qt, "author": author, "tags": [], "_pos": line_starts[i]})
+    return out
 
 # -----------------------------
 # Main extract_quotes (all modes)
@@ -429,8 +524,10 @@ def extract_quotes(
     enable_quote_lists: bool = True,
     enable_table_rows: bool = True,
     enable_paragraph_carry: bool = True,
+    enable_inline_quote_attribution: bool = True,
 ) -> List[Dict[str, object]]:
     raw = normalize_ws(text)
+    line_starts = build_line_starts(raw)
 
     results: List[Dict[str, object]] = []
     seen = set()
@@ -460,6 +557,23 @@ def extract_quotes(
             lastname_map_ready = True
         return lastname_map or {}
 
+    # 0) Inline quoted lines with author (common format)
+    if enable_inline_quote_attribution:
+        for r in extract_inline_quote_attribution_lines(
+            raw,
+            default_author=default_author,
+            min_len=min_len,
+            max_len=max_len,
+            max_newlines=max_newlines,
+            max_sentences=max_sentences,
+            line_starts=line_starts,
+        ):
+            k = dedupe_key(r["text"])
+            if k in seen:
+                continue
+            seen.add(k)
+            results.append(r)
+
     # 1) Quoted spans
     spans = scan_quote_spans(raw)
     for (s, e) in spans:
@@ -468,10 +582,10 @@ def extract_quotes(
         if not cleaned:
             continue
 
-        key = normalize_key(cleaned)
-        if key in seen:
+        k = dedupe_key(cleaned)
+        if k in seen:
             continue
-        seen.add(key)
+        seen.add(k)
 
         before = raw[max(0, s - CTX_WINDOW) : s]
         after = raw[e + 1 : min(len(raw), e + 1 + CTX_WINDOW)]
@@ -479,10 +593,6 @@ def extract_quotes(
         para_i = paragraph_index_for_pos(s)
         carry_author = last_author_by_para.get(para_i) if enable_paragraph_carry else None
 
-        # Only build lastname_map if we might use it:
-        # if attribution returns a single-token name we can upgrade later.
-        # Here we just pass it lazily as None; resolver will only consult if provided.
-        # To preserve ability to upgrade last names, we provide it when there are multiple quotes (typical news style).
         lm = get_lastname_map() if len(spans) >= 2 else None
 
         author = resolve_author_for_quote(
@@ -516,12 +626,12 @@ def extract_quotes(
             if not cleaned:
                 continue
 
-            key = normalize_key(cleaned)
-            if key in seen:
+            k = dedupe_key(cleaned)
+            if k in seen:
                 continue
-            seen.add(key)
+            seen.add(k)
 
-            results.append({"text": cleaned, "author": speaker, "tags": [], "_pos": i})
+            results.append({"text": cleaned, "author": speaker, "tags": [], "_pos": line_starts[i]})
 
     # 3) Unquoted quote-lists
     if enable_quote_lists:
@@ -532,11 +642,12 @@ def extract_quotes(
             max_len=max_len,
             max_newlines=max_newlines,
             max_sentences=max_sentences,
+            line_starts=line_starts,
         ):
-            key = normalize_key(r["text"])
-            if key in seen:
+            k = dedupe_key(r["text"])
+            if k in seen:
                 continue
-            seen.add(key)
+            seen.add(k)
             results.append(r)
 
     # 4) Table rows
@@ -548,14 +659,15 @@ def extract_quotes(
             max_len=max_len,
             max_newlines=max_newlines,
             max_sentences=max_sentences,
+            line_starts=line_starts,
         ):
-            key = normalize_key(r["text"])
-            if key in seen:
+            k = dedupe_key(r["text"])
+            if k in seen:
                 continue
-            seen.add(key)
+            seen.add(k)
             results.append(r)
 
-    # Post-pass: attach Goodreads tags/attribution to nearest previous quote
+    # Post-pass: attach Goodreads tags/attribution to nearest previous quote (char offset aligned)
     results.sort(key=lambda x: int(x.get("_pos", 0)))
     positions = [int(r.get("_pos", 0)) for r in results]
 
@@ -563,22 +675,20 @@ def extract_quotes(
         j = bisect_right(positions, pos) - 1
         return j if j >= 0 else None
 
-    running_pos = 0
-    for line in raw.splitlines():
+    for i, line in enumerate(raw.splitlines()):
+        pos = line_starts[i]
         stripped = line.strip()
 
         m_tags = GOODREADS_TAGS_RE.match(stripped)
         if m_tags:
-            j = prev_index(running_pos)
+            j = prev_index(pos)
             if j is not None:
                 results[j]["tags"] = parse_tag_line(m_tags.group(1))
 
         m_attr = ATTRIBUTION_LINE_RE.match(stripped)
         if m_attr:
-            j = prev_index(running_pos)
+            j = prev_index(pos)
             if j is not None and results[j]["author"] == default_author:
                 results[j]["author"] = tidy_quote_text(m_attr.group(1))
-
-        running_pos += len(line) + 1
 
     return [{"text": r["text"], "author": r["author"], "tags": r.get("tags", [])} for r in results]
