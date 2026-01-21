@@ -65,10 +65,10 @@ def cached_parse(
     min_len: int,
     max_newlines: int,
     max_sentences: int,
-    enable_speaker_labels: bool,
-    enable_quote_lists: bool,
-    enable_table_rows: bool,
-    enable_paragraph_carry: bool,
+    enable_dialogue_lines: bool,
+    enable_quote_collections: bool,
+    enable_tables: bool,
+    enable_paragraph_attribution: bool,
 ) -> List[Dict[str, object]]:
     parsed = extract_quotes(
         source_text,
@@ -77,10 +77,10 @@ def cached_parse(
         max_len=240,  # fixed
         max_newlines=max_newlines,
         max_sentences=max_sentences,
-        enable_speaker_labels=enable_speaker_labels,
-        enable_quote_lists=enable_quote_lists,
-        enable_table_rows=enable_table_rows,
-        enable_paragraph_carry=enable_paragraph_carry,
+        enable_dialogue_lines=enable_dialogue_lines,
+        enable_quote_collections=enable_quote_collections,
+        enable_tables=enable_tables,
+        enable_paragraph_attribution=enable_paragraph_attribution,
     )
     for r in parsed:
         r["approve"] = True
@@ -108,14 +108,14 @@ with st.sidebar:
     min_len = st.number_input("Min length", min_value=1, max_value=500, value=30)
     st.number_input("Max length", min_value=30, max_value=240, value=240, disabled=True)
     st.caption("Max length is fixed at 240 by design (per project requirement).")
-    max_sentences = st.number_input("Max sentences", min_value=1, max_value=10, value=2)
+    max_sentences = st.number_input("Max sentences", min_value=1, max_value=10, value=6)  # UPDATED DEFAULT
     max_newlines = st.number_input("Max newlines", min_value=0, max_value=10, value=1)
 
     st.subheader("Extraction modes")
-    enable_speaker_labels = st.toggle("Transcript speaker labels (LABEL: text)", value=True)
-    enable_quote_lists = st.toggle("Quote-list mode (Number X / author carry / Goodreads)", value=True)
-    enable_table_rows = st.toggle("Table/TSV row mode (quote ⟂ author ⟂ ...)", value=True)
-    enable_paragraph_carry = st.toggle("Carry-forward author within paragraph", value=True)
+    enable_dialogue_lines = st.toggle("Dialogue lines (LABEL: text)", value=True)
+    enable_quote_collections = st.toggle("Quote collections (Goodreads / bullets / quote pages)", value=True)
+    enable_tables = st.toggle("Tables/TSV rows (quote ⟂ author ⟂ ...)", value=True)
+    enable_paragraph_attribution = st.toggle("Carry author within paragraph", value=True)
 
     st.subheader("Tag helpers")
     global_tags = st.text_input("Global tags (comma-separated, applied on save)", value="")
@@ -156,10 +156,10 @@ if parse_clicked:
         min_len=int(min_len),
         max_newlines=int(max_newlines),
         max_sentences=int(max_sentences),
-        enable_speaker_labels=bool(enable_speaker_labels),
-        enable_quote_lists=bool(enable_quote_lists),
-        enable_table_rows=bool(enable_table_rows),
-        enable_paragraph_carry=bool(enable_paragraph_carry),
+        enable_dialogue_lines=bool(enable_dialogue_lines),
+        enable_quote_collections=bool(enable_quote_collections),
+        enable_tables=bool(enable_tables),
+        enable_paragraph_attribution=bool(enable_paragraph_attribution),
     )
 
 if clear_clicked:
