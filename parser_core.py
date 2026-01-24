@@ -162,7 +162,7 @@ NUMBER_HEADER_RE = re.compile(r"^\s*Number\s+\w+\s*:\s*(?:\(.+?\))?\s*$", re.IGN
 ATTRIBUTION_LINE_RE = re.compile(r"^\s*(?:—|―|-)\s*([^,\n]{2,120})(?:,.*)?\s*$")
 SPEAKER_LABEL_RE = re.compile(r"^\s*([A-Z][A-Z0-9_ \-]{1,24})\s*:\s*(.+?)\s*$")
 
-# NEW: transcripts often use Title Case speaker labels (Host:, Fortney:, Kristen Fortney:)
+# transcripts often use Title Case speaker labels (Host:, Fortney:, Kristen Fortney:)
 TITLE_SPEAKER_LABEL_RE = re.compile(r"^\s*([A-Z][A-Za-z.'\- ]{1,40})\s*:\s*(.+?)\s*$")
 BAD_SPEAKER_LABELS = {
     "Transcript", "Advertisement", "Sponsored", "Related", "Read More", "More", "Note",
@@ -211,8 +211,6 @@ def looks_like_headline(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
-    if any(ch in stripped for ch in "“”\""):
-        return True if stripped.isupper() else False
     letters = [c for c in stripped if c.isalpha()]
     if not letters:
         return False
@@ -230,7 +228,6 @@ def has_quote_collection_cues(text: str) -> bool:
     tags = sum(1 for l in nonempty if GOODREADS_TAGS_RE.match(l.strip()))
     quoted = sum(1 for l in nonempty if QUOTEY_LINE_RE.search(l))
 
-    # NEW: allow quote pages that are mostly "Author" lines + quotes without bullets/quotes
     authorish = sum(1 for l in nonempty if is_author_line_candidate(l))
 
     if tags > 0 or attributions > 0:
@@ -261,15 +258,42 @@ def parse_tag_line(tag_line: str) -> List[str]:
     return out
 
 # -----------------------------
-# Quoted-span scanning (nesting-aware)
+# Quoted-span scanning (paragraph-scoped, nesting-aware, resilient)
 # -----------------------------
+
+_PARA_SPLIT_RE = re.compile(r"\n\s*\n")
 
 def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
     """
     Returns outermost spans for “...” and "..." and «...» (best-effort).
-    Avoid pairing escaped quotes and inch marks (5").
+
+    Improvements:
+      - scans per paragraph to prevent cross-paragraph poisoning
+      - ignores likely dangling closing straight quotes when stack is empty
+      - ignores OCR/apostrophe-like quotes inside words (I"m, don"t)
+      - still avoids inch marks (5")
     """
     spans: List[Tuple[int, int]] = []
+    for p_start, p_end in _paragraph_ranges(text):
+        spans.extend(_scan_quote_spans_in_block(text, p_start, p_end))
+
+    spans.sort(key=lambda x: (x[0], x[1]))
+    return _outermost_intervals(spans)
+
+def _paragraph_ranges(text: str) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    for m in _PARA_SPLIT_RE.finditer(text):
+        end = m.start()
+        if start < end:
+            ranges.append((start, end))
+        start = m.end()
+    if start < len(text):
+        ranges.append((start, len(text)))
+    return ranges
+
+def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
     curly_stack: List[int] = []
     straight_stack: List[int] = []
     angle_stack: List[int] = []
@@ -280,31 +304,81 @@ def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
     def looks_like_inch_mark(i: int) -> bool:
         return i > 0 and text[i - 1].isdigit()
 
-    for i, ch in enumerate(text):
+    def is_word_char(ch: str) -> bool:
+        return ch.isalpha() or ch.isdigit() or ch == "_"
+
+    def looks_like_apostrophe_quote(i: int) -> bool:
+        # I"m, don"t, we"re (OCR/mangled apostrophes)
+        if i <= 0 or i + 1 >= len(text):
+            return False
+        return is_word_char(text[i - 1]) and is_word_char(text[i + 1])
+
+    def looks_like_dangling_closer(i: int) -> bool:
+        # ... respect", after ...
+        if i <= 0:
+            return False
+        if not is_word_char(text[i - 1]):
+            return False
+        j = i + 1
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text):
+            return False
+        return text[j] in ",.;:)]}"
+
+    for i in range(start, end):
+        ch = text[i]
+
         if ch == "“":
             curly_stack.append(i)
-        elif ch == "”":
+            continue
+        if ch == "”":
             if curly_stack:
-                spans.append((curly_stack.pop(), i))
-        elif ch == "«":
-            angle_stack.append(i)
-        elif ch == "»":
-            if angle_stack:
-                spans.append((angle_stack.pop(), i))
-        elif ch == '"':
-            if is_escaped(i) or looks_like_inch_mark(i):
-                continue
-            if straight_stack:
-                spans.append((straight_stack.pop(), i))
-            else:
-                straight_stack.append(i)
+                out.append((curly_stack.pop(), i))
+            continue
 
-    spans.sort(key=lambda x: (x[0], -x[1]))
+        if ch == "«":
+            angle_stack.append(i)
+            continue
+        if ch == "»":
+            if angle_stack:
+                out.append((angle_stack.pop(), i))
+            continue
+
+        if ch != '"':
+            continue
+
+        if is_escaped(i) or looks_like_inch_mark(i) or looks_like_apostrophe_quote(i):
+            continue
+
+        if straight_stack:
+            out.append((straight_stack.pop(), i))
+            continue
+
+        if looks_like_dangling_closer(i):
+            continue
+
+        straight_stack.append(i)
+
+    return out
+
+def _outermost_intervals(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    if not spans:
+        return []
+    # start asc, end desc -> outer spans first
+    spans = sorted(spans, key=lambda x: (x[0], -x[1]))
     outer: List[Tuple[int, int]] = []
+    cur_start = -1
+    cur_end = -1
     for s, e in spans:
-        if outer and s >= outer[-1][0] and e <= outer[-1][1]:
+        if not outer:
+            outer.append((s, e))
+            cur_start, cur_end = s, e
+            continue
+        if s >= cur_start and e <= cur_end:
             continue
         outer.append((s, e))
+        cur_start, cur_end = s, e
     outer.sort(key=lambda x: x[0])
     return outer
 
@@ -312,7 +386,6 @@ def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
 # Attribution (names + verbs + orgs)
 # -----------------------------
 
-# Improved name token (news-grade): supports initials + common particles + suffixes.
 NAME_WORD = r"[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+(?:[-'][A-ZÀ-ÖØ-Þa-zà-öø-ÿ]+)?"
 INITIALS  = r"(?:[A-Z]\.){1,3}"  # J. or J.K. or J. K.
 PARTICLE  = r"(?:de|del|da|di|la|le|van|von|der|den|du|st)\.?"
@@ -321,8 +394,11 @@ SUFFIX    = r"(?:Jr\.|Sr\.|II|III|IV)"
 NAME_TOKEN = rf"(?:{NAME_WORD}|{INITIALS})"
 NAME_PHRASE = rf"{NAME_TOKEN}(?:\s+(?:{PARTICLE}\s+)?{NAME_TOKEN}){{0,4}}(?:\s+{SUFFIX})?"
 
-FULLNAME_RE = re.compile(rf"\b({NAME_TOKEN})(?:\s+(?:{PARTICLE}\s+)?({NAME_TOKEN}))?(?:\s+(?:{PARTICLE}\s+)?({NAME_TOKEN}))?(?:\s+(?:{PARTICLE}\s+)?({NAME_TOKEN}))?(?:\s+({SUFFIX}))?\b")
-
+FULLNAME_RE = re.compile(
+    rf"\b({NAME_TOKEN})(?:\s+(?:{PARTICLE}\s+)?({NAME_TOKEN}))?"
+    rf"(?:\s+(?:{PARTICLE}\s+)?({NAME_TOKEN}))?(?:\s+(?:{PARTICLE}\s+)?({NAME_TOKEN}))?"
+    rf"(?:\s+({SUFFIX}))?\b"
+)
 HONORIFIC_RE = re.compile(r"^(Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.)\s+", re.IGNORECASE)
 
 ATTR_VERB_RE = (
@@ -333,16 +409,16 @@ ATTR_VERB_RE = (
 
 ROLE_PREFIX = r"(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4}\s+)?"
 
-# Pronoun after quote: “…,” she says.
 PRONOUN_AFTER_RE = re.compile(
     rf"^\s*[,–—-]?\s*(he|she|they)\s+(?:{ATTR_VERB_RE})\b",
     re.IGNORECASE,
 )
 
-# Org phrase (conservative): TitleCase words ending in an org-ish suffix/abbrev
-ORG_SUFFIX = r"(?:Association|Society|College|Academy|Committee|Center|Centre|Agency|Department|Ministry|Office|"
-ORG_SUFFIX += r"Institute|Institution|University|Hospital|Clinic|Council|Board|Commission|Organization|Organisation|"
-ORG_SUFFIX += r"Foundation|Federation|Alliance|Group|Administration|CDC|WHO|AMA|NIH|FDA|UN|U\.N\.)"
+ORG_SUFFIX = (
+    r"(?:Association|Society|College|Academy|Committee|Center|Centre|Agency|Department|Ministry|Office|"
+    r"Institute|Institution|University|Hospital|Clinic|Council|Board|Commission|Organization|Organisation|"
+    r"Foundation|Federation|Alliance|Group|Administration|CDC|WHO|AMA|NIH|FDA|UN|U\.N\.)"
+)
 
 ORG_PHRASE_RE = re.compile(
     rf"\b([A-Z][A-Za-z&.\-']+(?:\s+[A-Z][A-Za-z&.\-']+){{0,8}}\s+{ORG_SUFFIX})\b"
@@ -361,18 +437,12 @@ BEFORE_ORG_ATTR_PATTERNS = [
 ]
 
 AFTER_ATTR_PATTERNS = [
-    # “...,” Name said
     re.compile(rf"^\s*[,–—-]?\s*({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
-    # “...,” said Name
     re.compile(rf"^\s*[,–—-]?\s*(?:{ATTR_VERB_RE})\s+({NAME_PHRASE})\b", re.IGNORECASE),
-    # “...,” Role Name said
     re.compile(rf"^\s*[,–—-]?\s*({ROLE_PREFIX}{NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
-    # “...,” Name, ... said
     re.compile(rf"^\s*[,–—-]?\s*({NAME_PHRASE})\s*,[^.]*?\b(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
-    # dash attribution without verb: “… ” — Name/Org
     re.compile(rf"^\s*[,–—-]?\s*[—–-]\s*({NAME_PHRASE})\b", re.IGNORECASE),
     re.compile(rf"^\s*[,–—-]?\s*[—–-]\s*({ORG_PHRASE_RE.pattern})\b", re.IGNORECASE),
-    # pronoun-ish / continuation
     re.compile(r"^\s*[,–—-]?\s*(their statement|they said|the statement)\s+(continued|said)\b", re.IGNORECASE),
 ]
 
@@ -385,10 +455,6 @@ BEFORE_ATTR_PATTERNS = [
 ]
 
 def extract_best_person_name(s: str) -> Optional[str]:
-    """
-    Extract the last plausible person name in s.
-    If roles/titles precede name, that's fine: FULLNAME_RE will find actual name tokens.
-    """
     s = normalize_ws(s)
     honorific = ""
     m_h = HONORIFIC_RE.match(s)
@@ -399,7 +465,6 @@ def extract_best_person_name(s: str) -> Optional[str]:
     matches = list(FULLNAME_RE.finditer(s))
     if matches:
         parts = [p for p in matches[-1].groups() if p]
-        # Filter out particles accidentally captured as NAME_TOKEN (rare)
         parts = [p for p in parts if p and p.lower().strip(".") not in {"de","del","da","di","la","le","van","von","der","den","du","st"}]
         return honorific + " ".join(parts).strip()
 
@@ -446,13 +511,25 @@ def infer_nearest_org_in_before(before: str) -> Optional[str]:
         return ms[-1].group(1).strip()
     return None
 
+def _looks_like_quoted_title(before: str, quote: str) -> bool:
+    q = quote.strip()
+    if len(q) > 90:
+        return False
+    if not q.endswith("?"):
+        return False
+    # e.g., podcast, "Why Should I Trust You?"
+    return bool(re.search(r"\b(podcast|episode|show|series)\b", before, re.IGNORECASE))
+
 def resolve_author_for_quote(
     context_before: str,
     context_after: str,
     default_author: str,
     lastname_map: Optional[Dict[str, str]],
     last_known_author_in_paragraph: Optional[str],
-) -> str:
+) -> Tuple[str, str]:
+    """
+    Returns (author, source) where source is a lightweight confidence hint.
+    """
     before = fast_context_norm(context_before)[-CTX_WINDOW:]
     after = fast_context_norm(context_after)[:CTX_WINDOW]
 
@@ -460,18 +537,18 @@ def resolve_author_for_quote(
     if re.search(r"\b(their statement|they said|the statement)\b", after, re.IGNORECASE):
         g = infer_group_author(before)
         if g:
-            return g
+            return g, "group_infer"
 
-    # NEW: Pronoun attribution after quote: “…,” she says.
+    # Pronoun attribution after quote: “…,” he said.
     if PRONOUN_AFTER_RE.search(after):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
             if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
                 inferred = lastname_map[inferred]
-            return inferred
-        # if can't infer, fall through to patterns/carry/default
+            return inferred, "after_pronoun"
+        # fall through
 
-    # NEW: Organization attribution after quote: “…,” the group said / The AMA said.
+    # Organization attribution after quote: “…,” the group said / The AMA said.
     for pat in AFTER_ORG_ATTR_PATTERNS:
         m = pat.search(after)
         if not m:
@@ -480,9 +557,9 @@ def resolve_author_for_quote(
         if src.lower() in GENERIC_ORG_WORDS:
             org = infer_nearest_org_in_before(before)
             if org:
-                return org
-            return last_known_author_in_paragraph or default_author
-        return src
+                return org, "after_org_infer"
+            return (last_known_author_in_paragraph or default_author), "carry_or_default"
+        return src, "after_org"
 
     # Person attribution after quote
     for pat in AFTER_ATTR_PATTERNS:
@@ -490,7 +567,7 @@ def resolve_author_for_quote(
         if not m:
             continue
         if not (m.lastindex and m.lastindex >= 1):
-            return last_known_author_in_paragraph or default_author
+            return (last_known_author_in_paragraph or default_author), "carry_or_default"
 
         name_src = m.group(1)
         name = extract_best_person_name(name_src)
@@ -498,9 +575,9 @@ def resolve_author_for_quote(
             name = name.split(",")[0].strip()
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name = lastname_map[name]
-            return name
+            return name, "after_name"
 
-    # NEW: Organization attribution before quote: The American Medical Association said … “...”
+    # Organization attribution before quote
     for pat in BEFORE_ORG_ATTR_PATTERNS:
         m = pat.search(before)
         if not m:
@@ -509,9 +586,9 @@ def resolve_author_for_quote(
         if src.lower() in GENERIC_ORG_WORDS:
             org = infer_nearest_org_in_before(before)
             if org:
-                return org
-            return last_known_author_in_paragraph or default_author
-        return src
+                return org, "before_org_infer"
+            return (last_known_author_in_paragraph or default_author), "carry_or_default"
+        return src, "before_org"
 
     # Person attribution before quote
     for pat in BEFORE_ATTR_PATTERNS:
@@ -524,9 +601,9 @@ def resolve_author_for_quote(
             name = name.split(",")[0].strip()
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name = lastname_map[name]
-            return name
+            return name, "before_name"
 
-    return last_known_author_in_paragraph or default_author
+    return (last_known_author_in_paragraph or default_author), "carry_or_default"
 
 # -----------------------------
 # Quote collections (curated lists)
@@ -686,7 +763,6 @@ def extract_inline_quote_attribution_lines(
             continue
 
         q_raw = m.group("q")
-        # If too long, chunk into multiple quotes (keeps max_len unchanged)
         candidates = chunk_quote_to_maxlen(q_raw, max_len=max_len) if len(tidy_quote_text(q_raw)) > max_len else [q_raw]
         author = tidy_quote_text(m.group("a") or m.group("a2") or default_author)
 
@@ -709,7 +785,6 @@ def ok_title_speaker(label: str) -> bool:
         return False
     if len(l.split()) > 6:
         return False
-    # Avoid obvious section headers
     if l.lower() in {"here’s what to know", "individual autonomy"}:
         return False
     return True
@@ -719,10 +794,10 @@ def extract_quotes(
     default_author: str = "Unknown",
     *,
     min_len: int = 30,
-    max_len: int = 240,          # DO NOT CHANGE
+    max_len: int = 240,          # default; can be changed by caller
     max_newlines: int = 1,
     max_sentences: int = 6,
-    # Modes (aligned with updated app.py)
+    # Modes
     enable_inline_attribution: bool = True,
     enable_quoted_spans: bool = True,
     enable_dialogue_lines: bool = True,
@@ -733,11 +808,11 @@ def extract_quotes(
     """
     Modes:
       - enable_inline_attribution: one-line quote + attribution (e.g., “...”— Author)
-      - enable_quoted_spans: quoted spans with contextual attribution (“...,” said Name / “…,” she says / “…,” the group said)
+      - enable_quoted_spans: quoted spans with contextual attribution
       - enable_dialogue_lines: LABEL: utterance (ALLCAPS and Title Case)
       - enable_quote_collections: curated lists (Goodreads/bullets/quote pages), gated by cues
       - enable_tables: TSV / column rows
-      - enable_paragraph_attribution: carry last author within paragraph
+      - enable_paragraph_attribution: carry last author within paragraph (gated by confidence)
     """
     raw = normalize_ws(text)
     line_starts = build_line_starts(raw)
@@ -759,7 +834,6 @@ def extract_quotes(
 
     last_author_by_para: Dict[int, str] = {}
 
-    # Build lastname_map lazily (only helpful when many names exist in the text)
     lastname_map: Optional[Dict[str, str]] = None
     lastname_map_ready = False
 
@@ -793,16 +867,22 @@ def extract_quotes(
         lm = get_lastname_map() if len(spans) >= 2 else None
         for (s, e) in spans:
             inside = raw[s + 1 : e]
-            # Chunk long quotes (keeps max_len unchanged)
-            candidates = chunk_quote_to_maxlen(inside, max_len=max_len) if len(tidy_quote_text(inside)) > max_len else [inside]
+            if not inside.strip():
+                continue
 
             before = raw[max(0, s - CTX_WINDOW) : s]
             after = raw[e + 1 : min(len(raw), e + 1 + CTX_WINDOW)]
 
+            # Optional: drop likely quoted titles (helps if min_len is lowered)
+            if _looks_like_quoted_title(before, inside):
+                continue
+
+            candidates = chunk_quote_to_maxlen(inside, max_len=max_len) if len(tidy_quote_text(inside)) > max_len else [inside]
+
             para_i = paragraph_index_for_pos(s)
             carry_author = last_author_by_para.get(para_i) if enable_paragraph_attribution else None
 
-            author = resolve_author_for_quote(
+            author, author_src = resolve_author_for_quote(
                 before,
                 after,
                 default_author=default_author,
@@ -810,8 +890,10 @@ def extract_quotes(
                 last_known_author_in_paragraph=carry_author,
             )
 
+            # Only carry forward when attribution is relatively strong
             if enable_paragraph_attribution and author and author != default_author:
-                last_author_by_para[para_i] = author
+                if author_src in {"after_name", "before_name", "after_org", "before_org"}:
+                    last_author_by_para[para_i] = author
 
             for cand in candidates:
                 cleaned = clamp_minimal(cand, min_len, max_len, max_newlines, max_sentences)
