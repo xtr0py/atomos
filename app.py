@@ -1,7 +1,8 @@
 import os
 import json
 import hashlib
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
+from collections import Counter
 
 import pandas as pd
 import streamlit as st
@@ -58,6 +59,61 @@ def append_jsonl(path: str, rows: List[Dict[str, object]]) -> int:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     return len(rows)
 
+# -----------------------------
+# Presets
+# -----------------------------
+
+PRESETS: Dict[str, Dict[str, bool]] = {
+    "News article (recommended)": {
+        "enable_inline_attribution": True,
+        "enable_quoted_spans": True,
+        "enable_dialogue_lines": False,
+        "enable_quote_collections": False,
+        "enable_tables": False,
+        "enable_paragraph_attribution": True,
+        "enable_speech_filter": True,  # key news quality improvement
+    },
+    "Transcript / Interview": {
+        "enable_inline_attribution": False,
+        "enable_quoted_spans": False,
+        "enable_dialogue_lines": True,
+        "enable_quote_collections": False,
+        "enable_tables": False,
+        "enable_paragraph_attribution": False,
+        "enable_speech_filter": True,
+    },
+    "Quote page / Goodreads": {
+        "enable_inline_attribution": True,
+        "enable_quoted_spans": False,
+        "enable_dialogue_lines": False,
+        "enable_quote_collections": True,
+        "enable_tables": False,
+        "enable_paragraph_attribution": False,
+        "enable_speech_filter": False,
+    },
+    "Table / TSV import": {
+        "enable_inline_attribution": False,
+        "enable_quoted_spans": False,
+        "enable_dialogue_lines": False,
+        "enable_quote_collections": False,
+        "enable_tables": True,
+        "enable_paragraph_attribution": False,
+        "enable_speech_filter": False,
+    },
+    "Custom": {},  # user controls toggles
+}
+
+def apply_preset(preset_name: str) -> None:
+    if preset_name not in PRESETS or preset_name == "Custom":
+        return
+    cfg = PRESETS[preset_name]
+    for k, v in cfg.items():
+        st.session_state[k] = v
+
+# -----------------------------
+# Cached parse
+# -----------------------------
+
 @st.cache_data(show_spinner=False)
 def cached_parse(
     source_text: str,
@@ -71,6 +127,8 @@ def cached_parse(
     enable_quote_collections: bool,
     enable_tables: bool,
     enable_paragraph_attribution: bool,
+    enable_speech_filter: bool,
+    include_debug: bool,
 ) -> List[Dict[str, object]]:
     parsed = extract_quotes(
         source_text,
@@ -85,27 +143,37 @@ def cached_parse(
         enable_quote_collections=enable_quote_collections,
         enable_tables=enable_tables,
         enable_paragraph_attribution=enable_paragraph_attribution,
+        enable_speech_filter=enable_speech_filter,
+        include_debug=include_debug,
     )
 
     # IMPORTANT: do not mutate cached object; create new list
     out: List[Dict[str, object]] = []
     for r in parsed:
         tags = r.get("tags", []) or []
-        out.append({
+        rec = {
             "approve": True,
             "text": r.get("text", ""),
             "author": r.get("author", ""),
             "tags": tags,
             "tags_str": tags_to_str(tags),
-        })
+        }
+        if include_debug:
+            rec["_mode"] = r.get("_mode", "")
+            rec["_author_src"] = r.get("_author_src", "")
+        out.append(rec)
     return out
 
-def as_editor_df(rows: List[Dict[str, object]]) -> pd.DataFrame:
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["approve", "text", "author", "tags_str"])
-    for col in ["approve", "text", "author", "tags_str"]:
+def as_editor_df(rows: List[Dict[str, object]], include_debug: bool) -> pd.DataFrame:
+    cols = ["approve", "text", "author", "tags_str"]
+    if include_debug:
+        cols = ["approve", "_mode", "_author_src", "text", "author", "tags_str"]
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
+    for col in cols:
         if col not in df.columns:
             df[col] = True if col == "approve" else ""
-    return df[["approve", "text", "author", "tags_str"]]
+    return df[cols]
 
 # -----------------------------
 # Sidebar settings
@@ -117,23 +185,87 @@ with st.sidebar:
     jsonl_path = st.text_input("JSONL output path", value=DEFAULT_JSONL_PATH)
     default_author = st.text_input("Default author (when none found)", value="Unknown")
 
+    st.subheader("Preset")
+    preset = st.selectbox("Choose a parsing profile", list(PRESETS.keys()), index=0)
+
+    # If preset changed, apply it
+    if "preset_last" not in st.session_state:
+        st.session_state["preset_last"] = preset
+        apply_preset(preset)
+    elif st.session_state["preset_last"] != preset:
+        st.session_state["preset_last"] = preset
+        apply_preset(preset)
+
     st.subheader("Minimal quote filters")
     min_len = st.number_input("Min length", min_value=1, max_value=500, value=30)
     st.number_input("Max length", min_value=30, max_value=240, value=240, disabled=True)
-    st.caption("Max length is fixed at 240 by design (per project requirement).")
+    st.caption("Max length is fixed at 240 by design.")
     max_sentences = st.number_input("Max sentences", min_value=1, max_value=10, value=6)
     max_newlines = st.number_input("Max newlines", min_value=0, max_value=10, value=1)
 
-    st.subheader("Extraction modes")
-    enable_inline_attribution = st.toggle("Inline attribution (“…” — Author)", value=True)
-    enable_quoted_spans = st.toggle("Quoted spans (“…”) with contextual attribution", value=True)
-    enable_dialogue_lines = st.toggle("Dialogue lines (LABEL: text)", value=True)
-    enable_quote_collections = st.toggle("Quote collections (GoodGoodreads / bullets / quote pages)", value=True)
-    enable_tables = st.toggle("Tables/TSV rows (quote ⟂ author ⟂ ...)", value=True)
-    enable_paragraph_attribution = st.toggle("Carry author within paragraph", value=True)
+    st.subheader("Basic modes")
+    enable_inline_attribution = st.toggle(
+        "Inline attribution (“…” — Author)",
+        value=st.session_state.get("enable_inline_attribution", True),
+        help="High-precision: finds one-line quotes with explicit attribution."
+    )
+    enable_quoted_spans = st.toggle(
+        "Quoted spans (“…”)",
+        value=st.session_state.get("enable_quoted_spans", True),
+        help="Core mode for news/articles: extracts quoted text and infers speaker from nearby 'X said' patterns."
+    )
+
+    st.subheader("Quality")
+    enable_speech_filter = st.toggle(
+        "Prefer speech-like quotes (reduce scare quotes)",
+        value=st.session_state.get("enable_speech_filter", True),
+        help="Filters out many editorial fragments in quotes (e.g., 'attacking a small business...')."
+    )
+
+    with st.expander("Advanced modes", expanded=(preset == "Custom")):
+        enable_dialogue_lines = st.toggle(
+            "Dialogue lines (LABEL: text)",
+            value=st.session_state.get("enable_dialogue_lines", True),
+            help="Best for transcripts/interviews where speakers are labeled."
+        )
+        enable_quote_collections = st.toggle(
+            "Quote collections (Goodreads / bullets / quote pages)",
+            value=st.session_state.get("enable_quote_collections", True),
+            help="Best for curated quote pages; automatically gated by cues."
+        )
+        enable_tables = st.toggle(
+            "Tables/TSV rows (quote ⟂ author ⟂ ...)",
+            value=st.session_state.get("enable_tables", True),
+            help="For tab-separated or column-aligned rows where quote and author are separate fields."
+        )
+
+        carry_disabled = not bool(enable_quoted_spans)
+        enable_paragraph_attribution = st.toggle(
+            "Carry author within paragraph",
+            value=st.session_state.get("enable_paragraph_attribution", True),
+            disabled=carry_disabled,
+            help="Used only with quoted spans; can help in news but may misattribute if paragraphs are long."
+        )
+        if carry_disabled:
+            st.caption("Carry author is only used when Quoted spans is enabled.")
+
+        include_debug = st.toggle(
+            "Show debug columns (mode / author source)",
+            value=False,
+            help="Adds internal columns to help you see which mode produced each quote."
+        )
 
     st.subheader("Tag helpers")
     global_tags = st.text_input("Global tags (comma-separated, applied on save)", value="")
+
+# Keep session_state in sync (so presets stick)
+st.session_state["enable_inline_attribution"] = bool(enable_inline_attribution)
+st.session_state["enable_quoted_spans"] = bool(enable_quoted_spans)
+st.session_state["enable_speech_filter"] = bool(enable_speech_filter)
+st.session_state["enable_dialogue_lines"] = bool(enable_dialogue_lines)
+st.session_state["enable_quote_collections"] = bool(enable_quote_collections)
+st.session_state["enable_tables"] = bool(enable_tables)
+st.session_state["enable_paragraph_attribution"] = bool(enable_paragraph_attribution)
 
 # -----------------------------
 # Dataset info
@@ -177,6 +309,8 @@ if parse_clicked:
         enable_quote_collections=bool(enable_quote_collections),
         enable_tables=bool(enable_tables),
         enable_paragraph_attribution=bool(enable_paragraph_attribution),
+        enable_speech_filter=bool(enable_speech_filter),
+        include_debug=bool(include_debug),
     )
 
 if clear_clicked:
@@ -196,18 +330,29 @@ if not rows:
 st.subheader(f"Review ({len(rows)} found)")
 st.caption("Edit text/author/tags. Uncheck approve to discard. Tags are comma-separated; extracted tags may already be present.")
 
-df = as_editor_df(rows)
+# Results-by-mode breakdown (measurable toggle value)
+if include_debug:
+    mode_counts = Counter(r.get("_mode", "unknown") or "unknown" for r in rows)
+    parts = [f"{k}: {v}" for k, v in sorted(mode_counts.items(), key=lambda x: (-x[1], x[0]))]
+    st.write("**Results by mode:** " + " • ".join(parts))
+
+df = as_editor_df(rows, include_debug=bool(include_debug))
+
+column_config = {
+    "approve": st.column_config.CheckboxColumn("Approve", width="small"),
+    "text": st.column_config.TextColumn("Text", width="large"),
+    "author": st.column_config.TextColumn("Author", width="medium"),
+    "tags_str": st.column_config.TextColumn("Tags (comma-separated)", width="medium"),
+}
+if include_debug:
+    column_config["_mode"] = st.column_config.TextColumn("Mode", width="small")
+    column_config["_author_src"] = st.column_config.TextColumn("Author src", width="small")
 
 edited = st.data_editor(
     df,
     use_container_width=True,
     num_rows="fixed",
-    column_config={
-        "approve": st.column_config.CheckboxColumn("Approve", width="small"),
-        "text": st.column_config.TextColumn("Text", width="large"),
-        "author": st.column_config.TextColumn("Author", width="medium"),
-        "tags_str": st.column_config.TextColumn("Tags (comma-separated)", width="medium"),
-    },
+    column_config=column_config,
 )
 
 approve_count = int(edited["approve"].sum())
@@ -258,7 +403,7 @@ for rec in approved_preview.to_dict("records"):
 if to_write:
     appended = append_jsonl(jsonl_path, to_write)
     st.success(f"Saved **{appended}** new quote(s) to `{jsonl_path}`.")
-    load_existing_keys.clear()  # refresh dataset count next run
+    load_existing_keys.clear()
 else:
     st.warning("No new quotes to save after validation/dedupe.")
 
