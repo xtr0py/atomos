@@ -1,7 +1,7 @@
 import os
 import json
 import hashlib
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Set
 from collections import Counter
 
 import pandas as pd
@@ -60,20 +60,59 @@ def append_jsonl(path: str, rows: List[Dict[str, object]]) -> int:
     return len(rows)
 
 # -----------------------------
-# Presets
+# Presets + UX copy
 # -----------------------------
 
+PRESET_ORDER = [
+    "📰 News article (recommended)",
+    "🎙 Transcript / Interview",
+    "📜 Curated quote list (quote pages / Goodreads)",
+    "📊 Table import (quote + author columns)",
+    "⚙ Custom",
+]
+
+# Detailed “Part 4” text — used as mouse-over tooltips and captions
+PRESET_LONG_HELP: Dict[str, str] = {
+    "📰 News article (recommended)":
+        "Use for standard articles or blog posts that mix narrative text with quoted speech.\n"
+        "Automatically finds quoted text, infers speakers from nearby “X said” patterns, and filters out many editorial “scare quotes.”",
+
+    "🎙 Transcript / Interview":
+        "Use for interviews, hearings, or transcripts where speakers are labeled (e.g., HOST:, NEWSOM:, Q: / A:).\n"
+        "Prioritizes speaker labels and avoids extracting incidental quoted phrases.",
+
+    "📜 Curated quote list (quote pages / Goodreads)":
+        "Use for pages that are primarily lists of quotes, often with bullets, separators, author lines, or tags.\n"
+        "Optimized for quote databases and Goodreads-style pages.",
+
+    "📊 Table import (quote + author columns)":
+        "Use when text is already structured into columns, such as tab-separated or space-aligned rows with quote and author fields.\n"
+        "Ignores prose parsing for maximum precision.",
+
+    "⚙ Custom":
+        "Use when none of the presets fit your input, or when you want full manual control over parsing behavior.",
+}
+
+PRESET_CAPTION: Dict[str, str] = {
+    "📰 News article (recommended)": "Best for articles/blog posts: quoted speech + “X said” attribution.",
+    "🎙 Transcript / Interview": "Best for speaker-labeled text: HOST:, NAME:, Q:/A:.",
+    "📜 Curated quote list (quote pages / Goodreads)": "Best for quote collections: bullets, — Author lines, tags.",
+    "📊 Table import (quote + author columns)": "Best for structured rows: quote<TAB>author or aligned columns.",
+    "⚙ Custom": "Manual control for edge cases or debugging.",
+}
+
+# Actual parser config per preset
 PRESETS: Dict[str, Dict[str, bool]] = {
-    "News article (recommended)": {
+    "📰 News article (recommended)": {
         "enable_inline_attribution": True,
         "enable_quoted_spans": True,
         "enable_dialogue_lines": False,
         "enable_quote_collections": False,
         "enable_tables": False,
         "enable_paragraph_attribution": True,
-        "enable_speech_filter": True,  # key news quality improvement
+        "enable_speech_filter": True,
     },
-    "Transcript / Interview": {
+    "🎙 Transcript / Interview": {
         "enable_inline_attribution": False,
         "enable_quoted_spans": False,
         "enable_dialogue_lines": True,
@@ -82,7 +121,7 @@ PRESETS: Dict[str, Dict[str, bool]] = {
         "enable_paragraph_attribution": False,
         "enable_speech_filter": True,
     },
-    "Quote page / Goodreads": {
+    "📜 Curated quote list (quote pages / Goodreads)": {
         "enable_inline_attribution": True,
         "enable_quoted_spans": False,
         "enable_dialogue_lines": False,
@@ -91,7 +130,7 @@ PRESETS: Dict[str, Dict[str, bool]] = {
         "enable_paragraph_attribution": False,
         "enable_speech_filter": False,
     },
-    "Table / TSV import": {
+    "📊 Table import (quote + author columns)": {
         "enable_inline_attribution": False,
         "enable_quoted_spans": False,
         "enable_dialogue_lines": False,
@@ -100,11 +139,11 @@ PRESETS: Dict[str, Dict[str, bool]] = {
         "enable_paragraph_attribution": False,
         "enable_speech_filter": False,
     },
-    "Custom": {},  # user controls toggles
+    "⚙ Custom": {},  # user controls toggles
 }
 
 def apply_preset(preset_name: str) -> None:
-    if preset_name not in PRESETS or preset_name == "Custom":
+    if preset_name not in PRESETS or preset_name == "⚙ Custom":
         return
     cfg = PRESETS[preset_name]
     for k, v in cfg.items():
@@ -147,7 +186,7 @@ def cached_parse(
         include_debug=include_debug,
     )
 
-    # IMPORTANT: do not mutate cached object; create new list
+    # IMPORTANT: do not mutate cached objects; create new records
     out: List[Dict[str, object]] = []
     for r in parsed:
         tags = r.get("tags", []) or []
@@ -186,7 +225,27 @@ with st.sidebar:
     default_author = st.text_input("Default author (when none found)", value="Unknown")
 
     st.subheader("Preset")
-    preset = st.selectbox("Choose a parsing profile", list(PRESETS.keys()), index=0)
+
+    # Mouse-over help (Part 4) on the preset selector
+    preset = st.selectbox(
+        "Choose a parsing profile",
+        PRESET_ORDER,
+        index=0,
+        help=(
+            "Pick a preset that matches the structure of your input text.\n\n"
+            "📰 News article (recommended): prose with quoted speech + attribution.\n"
+            "🎙 Transcript / Interview: speaker labels like HOST:, NAME:, Q:/A:.\n"
+            "📜 Curated quote list: bullets, — Author lines, tags (Goodreads-style).\n"
+            "📊 Table import: quote + author in columns (tab-separated or aligned).\n"
+            "⚙ Custom: manual control over extraction options.\n\n"
+            "Hover the preset names (below) for more detail via the caption, or open Advanced for debug."
+        )
+    )
+
+    # Dynamic caption shows the selected preset’s “Part 4” description concisely
+    st.caption(PRESET_CAPTION.get(preset, ""))
+    with st.expander("What does this preset do?", expanded=False):
+        st.write(PRESET_LONG_HELP.get(preset, ""))
 
     # If preset changed, apply it
     if "preset_last" not in st.session_state:
@@ -204,39 +263,73 @@ with st.sidebar:
     max_newlines = st.number_input("Max newlines", min_value=0, max_value=10, value=1)
 
     st.subheader("Basic modes")
+
     enable_inline_attribution = st.toggle(
         "Inline attribution (“…” — Author)",
         value=st.session_state.get("enable_inline_attribution", True),
-        help="High-precision: finds one-line quotes with explicit attribution."
+        help=(
+            "High precision.\n"
+            "Use for quote pages and some articles where attribution is explicit on the same line.\n\n"
+            "Example:\n"
+            "  “A quote here.” — Jane Doe"
+        ),
     )
+
     enable_quoted_spans = st.toggle(
         "Quoted spans (“…”)",
         value=st.session_state.get("enable_quoted_spans", True),
-        help="Core mode for news/articles: extracts quoted text and infers speaker from nearby 'X said' patterns."
+        help=(
+            "Core mode for news/articles.\n"
+            "Finds quoted text and infers the speaker from nearby attribution patterns like “X said”.\n\n"
+            "Example:\n"
+            "  “A quote here,” Newsom said."
+        ),
     )
 
     st.subheader("Quality")
+
     enable_speech_filter = st.toggle(
         "Prefer speech-like quotes (reduce scare quotes)",
         value=st.session_state.get("enable_speech_filter", True),
-        help="Filters out many editorial fragments in quotes (e.g., 'attacking a small business...')."
+        help=(
+            "Reduces false positives from editorial or ‘scare quotes’ in news.\n"
+            "Keeps quotes that look like actual spoken statements; drops many short framed fragments.\n\n"
+            "Often removes things like:\n"
+            "  accused him of “attacking a small business …”"
+        ),
     )
 
-    with st.expander("Advanced modes", expanded=(preset == "Custom")):
+    with st.expander("Advanced modes", expanded=(preset == "⚙ Custom")):
         enable_dialogue_lines = st.toggle(
             "Dialogue lines (LABEL: text)",
-            value=st.session_state.get("enable_dialogue_lines", True),
-            help="Best for transcripts/interviews where speakers are labeled."
+            value=st.session_state.get("enable_dialogue_lines", False),
+            help=(
+                "Best for transcripts/interviews.\n"
+                "Extracts speaker-labeled lines like HOST: …, Q: …, A: …\n\n"
+                "Example:\n"
+                "  HOST: Welcome back to the show."
+            ),
         )
+
         enable_quote_collections = st.toggle(
-            "Quote collections (Goodreads / bullets / quote pages)",
-            value=st.session_state.get("enable_quote_collections", True),
-            help="Best for curated quote pages; automatically gated by cues."
+            "Curated quote lists (bullets / Goodreads / quote pages)",
+            value=st.session_state.get("enable_quote_collections", False),
+            help=(
+                "Use when the text is mostly a list of quotes with author lines, bullets, or tags.\n"
+                "Automatically gated by cues (bullets, attribution lines, tags) to reduce noise."
+            ),
         )
+
         enable_tables = st.toggle(
-            "Tables/TSV rows (quote ⟂ author ⟂ ...)",
-            value=st.session_state.get("enable_tables", True),
-            help="For tab-separated or column-aligned rows where quote and author are separate fields."
+            "Table import (quote ⟂ author ⟂ ...)",
+            value=st.session_state.get("enable_tables", False),
+            help=(
+                "Use when your content is structured into columns:\n"
+                "- tab-separated (TSV)\n"
+                "- or aligned with multiple spaces\n\n"
+                "Example:\n"
+                "  Life is short.    Seneca"
+            ),
         )
 
         carry_disabled = not bool(enable_quoted_spans)
@@ -244,7 +337,11 @@ with st.sidebar:
             "Carry author within paragraph",
             value=st.session_state.get("enable_paragraph_attribution", True),
             disabled=carry_disabled,
-            help="Used only with quoted spans; can help in news but may misattribute if paragraphs are long."
+            help=(
+                "Used only with Quoted spans.\n"
+                "Helps when multiple quotes follow one strong attribution in the same paragraph.\n"
+                "Can misattribute if paragraphs are long or contain multiple speakers."
+            ),
         )
         if carry_disabled:
             st.caption("Carry author is only used when Quoted spans is enabled.")
@@ -252,7 +349,11 @@ with st.sidebar:
         include_debug = st.toggle(
             "Show debug columns (mode / author source)",
             value=False,
-            help="Adds internal columns to help you see which mode produced each quote."
+            help=(
+                "Adds internal columns so you can see:\n"
+                "- which extractor produced each quote\n"
+                "- which attribution rule assigned the author"
+            ),
         )
 
     st.subheader("Tag helpers")
@@ -330,7 +431,7 @@ if not rows:
 st.subheader(f"Review ({len(rows)} found)")
 st.caption("Edit text/author/tags. Uncheck approve to discard. Tags are comma-separated; extracted tags may already be present.")
 
-# Results-by-mode breakdown (measurable toggle value)
+# Results-by-mode breakdown
 if include_debug:
     mode_counts = Counter(r.get("_mode", "unknown") or "unknown" for r in rows)
     parts = [f"{k}: {v}" for k, v in sorted(mode_counts.items(), key=lambda x: (-x[1], x[0]))]
@@ -387,7 +488,6 @@ for rec in approved_preview.to_dict("records"):
     author = str(rec.get("author", "")).strip() or default_author
     tags = parse_tag_line(str(rec.get("tags_str", "")))
 
-    # Apply global tags (merge, case-insensitive)
     if global_tag_list:
         existing_lower = {x.lower() for x in tags}
         tags.extend([t for t in global_tag_list if t.lower() not in existing_lower])
