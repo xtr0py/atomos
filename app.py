@@ -65,6 +65,8 @@ def cached_parse(
     min_len: int,
     max_newlines: int,
     max_sentences: int,
+    enable_inline_attribution: bool,
+    enable_quoted_spans: bool,
     enable_dialogue_lines: bool,
     enable_quote_collections: bool,
     enable_tables: bool,
@@ -77,15 +79,26 @@ def cached_parse(
         max_len=240,  # fixed
         max_newlines=max_newlines,
         max_sentences=max_sentences,
+        enable_inline_attribution=enable_inline_attribution,
+        enable_quoted_spans=enable_quoted_spans,
         enable_dialogue_lines=enable_dialogue_lines,
         enable_quote_collections=enable_quote_collections,
         enable_tables=enable_tables,
         enable_paragraph_attribution=enable_paragraph_attribution,
     )
+
+    # IMPORTANT: do not mutate cached object; create new list
+    out: List[Dict[str, object]] = []
     for r in parsed:
-        r["approve"] = True
-        r["tags_str"] = tags_to_str(r.get("tags", []))
-    return parsed
+        tags = r.get("tags", []) or []
+        out.append({
+            "approve": True,
+            "text": r.get("text", ""),
+            "author": r.get("author", ""),
+            "tags": tags,
+            "tags_str": tags_to_str(tags),
+        })
+    return out
 
 def as_editor_df(rows: List[Dict[str, object]]) -> pd.DataFrame:
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["approve", "text", "author", "tags_str"])
@@ -108,12 +121,14 @@ with st.sidebar:
     min_len = st.number_input("Min length", min_value=1, max_value=500, value=30)
     st.number_input("Max length", min_value=30, max_value=240, value=240, disabled=True)
     st.caption("Max length is fixed at 240 by design (per project requirement).")
-    max_sentences = st.number_input("Max sentences", min_value=1, max_value=10, value=6)  # UPDATED DEFAULT
+    max_sentences = st.number_input("Max sentences", min_value=1, max_value=10, value=6)
     max_newlines = st.number_input("Max newlines", min_value=0, max_value=10, value=1)
 
     st.subheader("Extraction modes")
+    enable_inline_attribution = st.toggle("Inline attribution (“…” — Author)", value=True)
+    enable_quoted_spans = st.toggle("Quoted spans (“…”) with contextual attribution", value=True)
     enable_dialogue_lines = st.toggle("Dialogue lines (LABEL: text)", value=True)
-    enable_quote_collections = st.toggle("Quote collections (Goodreads / bullets / quote pages)", value=True)
+    enable_quote_collections = st.toggle("Quote collections (GoodGoodreads / bullets / quote pages)", value=True)
     enable_tables = st.toggle("Tables/TSV rows (quote ⟂ author ⟂ ...)", value=True)
     enable_paragraph_attribution = st.toggle("Carry author within paragraph", value=True)
 
@@ -156,6 +171,8 @@ if parse_clicked:
         min_len=int(min_len),
         max_newlines=int(max_newlines),
         max_sentences=int(max_sentences),
+        enable_inline_attribution=bool(enable_inline_attribution),
+        enable_quoted_spans=bool(enable_quoted_spans),
         enable_dialogue_lines=bool(enable_dialogue_lines),
         enable_quote_collections=bool(enable_quote_collections),
         enable_tables=bool(enable_tables),
