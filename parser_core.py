@@ -221,7 +221,6 @@ NUMBER_HEADER_RE = re.compile(r"^\s*Number\s+\w+\s*:\s*(?:\(.+?\))?\s*$", re.IGN
 ATTRIBUTION_LINE_RE = re.compile(r"^\s*(?:—|―|-)\s*([^,\n]{2,120})(?:,.*)?\s*$")
 SPEAKER_LABEL_RE = re.compile(r"^\s*([A-Z][A-Z0-9_ \-]{1,24})\s*:\s*(.+?)\s*$")
 
-# transcripts often use Title Case speaker labels (Host:, Fortney:, Kristen Fortney:)
 TITLE_SPEAKER_LABEL_RE = re.compile(r"^\s*([A-Z][A-Za-z.'\- ]{1,40})\s*:\s*(.+?)\s*$")
 BAD_SPEAKER_LABELS = {
     "Transcript", "Advertisement", "Sponsored", "Related", "Read More", "More", "Note",
@@ -239,7 +238,6 @@ CHROME_RE = re.compile(
 )
 EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
 
-# Quote-collection cues (to avoid harvesting normal prose)
 BULLET_RE = re.compile(r"^\s*(?:[-*•‣▪]|(\d+)[.)])\s+")
 QUOTEY_LINE_RE = re.compile(r"[\"“”]")
 
@@ -286,7 +284,7 @@ def looks_like_headline(line: str) -> bool:
 # -----------------------------
 
 NAME_WORD = r"[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+(?:[-'][A-ZÀ-ÖØ-Þa-zà-öø-ÿ]+)?"
-INITIALS = r"(?:[A-Z]\.){1,3}"  # J. or J.K. or J. K.
+INITIALS = r"(?:[A-Z]\.){1,3}"
 PARTICLE = r"(?:de|del|da|di|la|le|van|von|der|den|du|st)\.?"
 SUFFIX = r"(?:Jr\.|Sr\.|II|III|IV)"
 
@@ -300,7 +298,6 @@ FULLNAME_RE = re.compile(
 )
 HONORIFIC_RE = re.compile(r"^(Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.)\s+", re.IGNORECASE)
 
-# Expanded for news verbs
 ATTR_VERB_RE = (
     r"(?:according to|said|says|tell|tells|told|wrote|write|writes|stated|states|notes|noted|argued|added|"
     r"explained|joked|quipped|teased|continued|recalled|insisted|admitted|warned|"
@@ -350,11 +347,8 @@ AFTER_ATTR_PATTERNS = [
 
 # Key improvement: support "Name, appositive clause, said ..." before quotes
 BEFORE_ATTR_PATTERNS = [
-    # Name said ... :
     re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“\"]{{0,120}}[:;,]?\s*$", re.IGNORECASE),
-    # Name, ... , said ... :
     re.compile(rf"({NAME_PHRASE})\s*,[^,\n]{{0,120}}?,\s*(?:{ATTR_VERB_RE})[^“\"]{{0,120}}[:;,]?\s*$", re.IGNORECASE),
-    # plea from Name
     re.compile(rf"\bplea from\s+({NAME_PHRASE})\b", re.IGNORECASE),
     re.compile(rf"\bthe plea\s+({NAME_PHRASE})\s+made\b", re.IGNORECASE),
     re.compile(rf"\b({NAME_PHRASE})\s+telling\b", re.IGNORECASE),
@@ -439,9 +433,6 @@ def resolve_author_for_quote(
     lastname_map: Optional[Dict[str, str]],
     last_known_author_in_paragraph: Optional[str],
 ) -> Tuple[str, str]:
-    """
-    Returns (author, source) where source is a lightweight confidence hint.
-    """
     before = fast_context_norm(context_before)[-CTX_WINDOW:]
     after = fast_context_norm(context_after)[:CTX_WINDOW]
 
@@ -574,8 +565,73 @@ def parse_tag_line(tag_line: str) -> List[str]:
     return out
 
 
+def extract_quote_collections(
+    text: str,
+    *,
+    default_author: str,
+    min_len: int,
+    max_len: int,
+    max_newlines: int,
+    max_sentences: int,
+    line_starts: List[int],
+    include_debug: bool,
+) -> List[Dict[str, object]]:
+    raw_lines = text.splitlines()
+    lines = [normalize_ws(l) for l in raw_lines]
+
+    results: List[Dict[str, object]] = []
+    current_author: Optional[str] = None
+    last_entry_index: Optional[int] = None
+
+    def add_entry(qtext: str, author: Optional[str], pos: int) -> None:
+        nonlocal last_entry_index
+        cleaned = clamp_minimal(qtext, min_len, max_len, max_newlines, max_sentences)
+        if not cleaned:
+            return
+        rec = {"text": cleaned, "author": author or default_author, "tags": [], "_pos": pos}
+        if include_debug:
+            rec["_mode"] = "collections"
+        results.append(rec)
+        last_entry_index = len(results) - 1
+
+    for idx, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line or is_noise_line(line):
+            continue
+
+        m_tags = GOODREADS_TAGS_RE.match(line)
+        if m_tags and last_entry_index is not None:
+            results[last_entry_index]["tags"] = parse_tag_line(m_tags.group(1))
+            continue
+
+        m_attr = ATTRIBUTION_LINE_RE.match(line)
+        if m_attr and last_entry_index is not None:
+            author = tidy_quote_text(m_attr.group(1))
+            results[last_entry_index]["author"] = author
+            current_author = author
+            continue
+
+        if NUMBER_HEADER_RE.match(line):
+            continue
+
+        if is_author_line_candidate(line):
+            current_author = tidy_quote_text(line)
+            continue
+
+        raw_src = raw_lines[idx]
+        is_bullet = bool(BULLET_RE.match(raw_src))
+        has_quote_marks = bool(QUOTEY_LINE_RE.search(raw_src))
+        if not is_bullet and not has_quote_marks:
+            continue
+
+        line_for_quote = BULLET_RE.sub("", raw_src).strip() if is_bullet else line
+        add_entry(line_for_quote, current_author, pos=line_starts[idx])
+
+    return results
+
+
 # -----------------------------
-# Quoted-span scanning (paragraph-scoped, nesting-aware, resilient)
+# Quoted-span scanning
 # -----------------------------
 
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
@@ -584,10 +640,8 @@ def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
     spans: List[Tuple[int, int]] = []
     for p_start, p_end in _paragraph_ranges(text):
         spans.extend(_scan_quote_spans_in_block(text, p_start, p_end))
-
     spans.sort(key=lambda x: (x[0], x[1]))
     return _outermost_intervals(spans)
-
 
 def _paragraph_ranges(text: str) -> List[Tuple[int, int]]:
     ranges: List[Tuple[int, int]] = []
@@ -600,7 +654,6 @@ def _paragraph_ranges(text: str) -> List[Tuple[int, int]]:
     if start < len(text):
         ranges.append((start, len(text)))
     return ranges
-
 
 def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[int, int]]:
     out: List[Tuple[int, int]] = []
@@ -670,7 +723,6 @@ def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[in
 
     return out
 
-
 def _outermost_intervals(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     if not spans:
         return []
@@ -702,7 +754,6 @@ def looks_like_author_field(field: str) -> bool:
     if not re.search(rf"\b{NAME_TOKEN}\b", f):
         return False
     return f.lower() not in {"english", "french", "spanish", "german"}
-
 
 def extract_table_rows(
     text: str,
@@ -738,75 +789,6 @@ def extract_table_rows(
         if include_debug:
             rec["_mode"] = "tables"
         results.append(rec)
-    return results
-
-
-# -----------------------------
-# Quote collections (curated lists)
-# -----------------------------
-
-def extract_quote_collections(
-    text: str,
-    *,
-    default_author: str,
-    min_len: int,
-    max_len: int,
-    max_newlines: int,
-    max_sentences: int,
-    line_starts: List[int],
-    include_debug: bool,
-) -> List[Dict[str, object]]:
-    raw_lines = text.splitlines()
-    lines = [normalize_ws(l) for l in raw_lines]
-
-    results: List[Dict[str, object]] = []
-    current_author: Optional[str] = None
-    last_entry_index: Optional[int] = None
-
-    def add_entry(qtext: str, author: Optional[str], pos: int) -> None:
-        nonlocal last_entry_index
-        cleaned = clamp_minimal(qtext, min_len, max_len, max_newlines, max_sentences)
-        if not cleaned:
-            return
-        rec = {"text": cleaned, "author": author or default_author, "tags": [], "_pos": pos}
-        if include_debug:
-            rec["_mode"] = "collections"
-        results.append(rec)
-        last_entry_index = len(results) - 1
-
-    for idx, raw_line in enumerate(lines):
-        line = raw_line.strip()
-        if not line or is_noise_line(line):
-            continue
-
-        m_tags = GOODREADS_TAGS_RE.match(line)
-        if m_tags and last_entry_index is not None:
-            results[last_entry_index]["tags"] = parse_tag_line(m_tags.group(1))
-            continue
-
-        m_attr = ATTRIBUTION_LINE_RE.match(line)
-        if m_attr and last_entry_index is not None:
-            author = tidy_quote_text(m_attr.group(1))
-            results[last_entry_index]["author"] = author
-            current_author = author
-            continue
-
-        if NUMBER_HEADER_RE.match(line):
-            continue
-
-        if is_author_line_candidate(line):
-            current_author = tidy_quote_text(line)
-            continue
-
-        raw_src = raw_lines[idx]
-        is_bullet = bool(BULLET_RE.match(raw_src))
-        has_quote_marks = bool(QUOTEY_LINE_RE.search(raw_src))
-        if not is_bullet and not has_quote_marks:
-            continue
-
-        line_for_quote = BULLET_RE.sub("", raw_src).strip() if is_bullet else line
-        add_entry(line_for_quote, current_author, pos=line_starts[idx])
-
     return results
 
 
@@ -873,7 +855,6 @@ def ok_title_speaker(label: str) -> bool:
         return False
     return True
 
-
 def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bool:
     if not new_author:
         return False
@@ -882,7 +863,6 @@ def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bo
     if old_author != default_author and new_author != default_author:
         return len(new_author) > len(old_author)
     return False
-
 
 def extract_quotes(
     text: str,
@@ -1064,7 +1044,7 @@ def extract_quotes(
                 rec["_mode"] = "dialogue"
             add_or_upgrade(rec)
 
-    # 4) Quote collections (curated lists) — gated
+    # 4) Quote collections — gated
     if enable_quote_collections and has_quote_collection_cues(raw):
         for r in extract_quote_collections(
             raw,
@@ -1116,7 +1096,6 @@ def extract_quotes(
             if j is not None and str(results[j].get("author", default_author)) == default_author:
                 results[j]["author"] = tidy_quote_text(m_attr.group(1))
 
-    # Return minimal by default; include debug fields only if requested
     if include_debug:
         return [
             {
