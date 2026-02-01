@@ -60,7 +60,7 @@ def append_jsonl(path: str, rows: List[Dict[str, object]]) -> int:
     return len(rows)
 
 # -----------------------------
-# Presets + UX copy
+# Presets + UX copy (Part 4 text ONLY in mouse-over)
 # -----------------------------
 
 PRESET_ORDER = [
@@ -71,7 +71,7 @@ PRESET_ORDER = [
     "⚙ Custom",
 ]
 
-# Detailed “Part 4” text — used as mouse-over tooltips and captions
+# “Part 4” detailed descriptions — ONLY used as tooltip text
 PRESET_LONG_HELP: Dict[str, str] = {
     "📰 News article (recommended)":
         "Use for standard articles or blog posts that mix narrative text with quoted speech.\n"
@@ -91,14 +91,6 @@ PRESET_LONG_HELP: Dict[str, str] = {
 
     "⚙ Custom":
         "Use when none of the presets fit your input, or when you want full manual control over parsing behavior.",
-}
-
-PRESET_CAPTION: Dict[str, str] = {
-    "📰 News article (recommended)": "Best for articles/blog posts: quoted speech + “X said” attribution.",
-    "🎙 Transcript / Interview": "Best for speaker-labeled text: HOST:, NAME:, Q:/A:.",
-    "📜 Curated quote list (quote pages / Goodreads)": "Best for quote collections: bullets, — Author lines, tags.",
-    "📊 Table import (quote + author columns)": "Best for structured rows: quote<TAB>author or aligned columns.",
-    "⚙ Custom": "Manual control for edge cases or debugging.",
 }
 
 # Actual parser config per preset
@@ -148,6 +140,21 @@ def apply_preset(preset_name: str) -> None:
     cfg = PRESETS[preset_name]
     for k, v in cfg.items():
         st.session_state[k] = v
+
+def preset_tooltip_text() -> str:
+    """
+    Builds the full preset tooltip, embedding Part 4 text for each preset.
+    This is shown ONLY on mouse-over (Streamlit “?” help).
+    """
+    lines: List[str] = []
+    lines.append("Presets configure the parser for common text formats.")
+    lines.append("")
+    for name in PRESET_ORDER:
+        lines.append(f"{name}")
+        lines.append(PRESET_LONG_HELP.get(name, "").strip())
+        lines.append("")
+    lines.append("Tip: Choose Custom to manually control all toggles.")
+    return "\n".join(lines).strip()
 
 # -----------------------------
 # Cached parse
@@ -226,26 +233,13 @@ with st.sidebar:
 
     st.subheader("Preset")
 
-    # Mouse-over help (Part 4) on the preset selector
+    # Part 4 text appears ONLY here (mouse-over “?”)
     preset = st.selectbox(
         "Choose a parsing profile",
         PRESET_ORDER,
         index=0,
-        help=(
-            "Pick a preset that matches the structure of your input text.\n\n"
-            "📰 News article (recommended): prose with quoted speech + attribution.\n"
-            "🎙 Transcript / Interview: speaker labels like HOST:, NAME:, Q:/A:.\n"
-            "📜 Curated quote list: bullets, — Author lines, tags (Goodreads-style).\n"
-            "📊 Table import: quote + author in columns (tab-separated or aligned).\n"
-            "⚙ Custom: manual control over extraction options.\n\n"
-            "Hover the preset names (below) for more detail via the caption, or open Advanced for debug."
-        )
+        help=preset_tooltip_text(),
     )
-
-    # Dynamic caption shows the selected preset’s “Part 4” description concisely
-    st.caption(PRESET_CAPTION.get(preset, ""))
-    with st.expander("What does this preset do?", expanded=False):
-        st.write(PRESET_LONG_HELP.get(preset, ""))
 
     # If preset changed, apply it
     if "preset_last" not in st.session_state:
@@ -343,8 +337,6 @@ with st.sidebar:
                 "Can misattribute if paragraphs are long or contain multiple speakers."
             ),
         )
-        if carry_disabled:
-            st.caption("Carry author is only used when Quoted spans is enabled.")
 
         include_debug = st.toggle(
             "Show debug columns (mode / author source)",
