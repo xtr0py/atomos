@@ -27,10 +27,7 @@ DEFAULT_MAX_SENTENCES = 6
 
 _SENT_SPLIT_RE = re.compile(r"[.!?]+(?:\s+|$)")
 _WS_SPACES_RE = re.compile(r"[ \t]+")
-
-# IMPORTANT: preserve blank lines; only trim spaces/tabs around a newline
-_WS_NEWLINE_TRIM_RE = re.compile(r"[ \t]*\n[ \t]*")
-
+_WS_NEWLINE_TRIM_RE = re.compile(r"[ \t]*\n[ \t]*")  # preserve blank lines
 _WS_MULTI_RE = re.compile(r"\s+")
 _PUNCT_SPACE_RE = re.compile(r"\s+([,.;:!?])")
 _DEDUPE_RE = re.compile(r"[\s\"“”‘’'`]+")
@@ -39,7 +36,7 @@ _DEDUPE_RE = re.compile(r"[\s\"“”‘’'`]+")
 def normalize_ws(s: str) -> str:
     """
     Normalize whitespace while preserving paragraph breaks.
-    - Keeps blank lines intact (critical for paragraph-scoped attribution + paragraph quote scanning).
+    Keeps blank lines intact (critical for paragraph-scoped attribution + paragraph quote scanning).
     """
     s = s.replace("\u00a0", " ")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -365,7 +362,13 @@ GENERIC_ROLE_SAID_RE = re.compile(
     re.IGNORECASE,
 )
 
-# IMPORTANT: no dash-name person attribution pattern here (it grabs photographer credits)
+# Prefer the reporting speaker in the lead-in clause (news pattern):
+# "... Karoline Leavitt, when asked..., said she thought ... “quote”"
+REPORTING_SPEAKER_BEFORE_RE = re.compile(
+    rf"({NAME_PHRASE})\s*,?[^“\"]{{0,220}}?\b(?:{ATTR_VERB_RE})\b",
+    re.IGNORECASE,
+)
+
 AFTER_ATTR_PATTERNS = [
     # shared attribution after a second quote:
     # “q1” and a “q2,” Trump claimed ...
@@ -400,22 +403,14 @@ NON_PERSON_LAST_TOKENS = {
 }
 
 TITLE_PSEUDO_NAMES = {
-    "the president",
-    "the vice president",
-    "the white house",
-    "the administration",
-    "the government",
-    "the spokesperson",
-    "the press secretary",
-    "the musician",
-    "the singer",
-    "the rapper",
-    "the artist",
-    "the actor",
-    "the comedian",
-    "the athlete",
-    "the judge",
-    "the court",
+    # with "the"
+    "the president", "the vice president", "the white house", "the administration", "the government",
+    "the spokesperson", "the press secretary", "the musician", "the singer", "the rapper", "the artist",
+    "the actor", "the comedian", "the athlete", "the judge", "the court",
+
+    # bare titles (so “President” doesn’t become an author)
+    "president", "vice president", "senator", "governor", "mayor", "speaker", "chair",
+    "commissioner", "judge", "press secretary", "spokesperson",
 }
 
 
@@ -429,7 +424,11 @@ def _is_non_person_name(name: str) -> bool:
 
 def _is_title_pseudo_name(name: str) -> bool:
     n = normalize_ws(name).lower()
-    return n in TITLE_PSEUDO_NAMES
+    if n in TITLE_PSEUDO_NAMES:
+        return True
+    if n.startswith("the "):
+        return n[4:] in TITLE_PSEUDO_NAMES
+    return False
 
 
 def clean_author_candidate(a: str) -> Optional[str]:
@@ -499,9 +498,15 @@ def infer_group_author(context_before: str) -> Optional[str]:
     return None
 
 
+def _followed_by_and_cap(text: str, token: str) -> bool:
+    # Helps avoid picking "Immigration" from "Immigration and Customs Enforcement"
+    return bool(re.search(rf"\b{re.escape(token)}\s+and\s+[A-Z]", text))
+
+
 def infer_nearest_name_in_before(before: str) -> Optional[str]:
     """
     Search backward and SKIP rejected candidates (org-ish endings, titles, credits).
+    Also avoids singleton tokens that are part of "X and Y ..." org phrases.
     """
     b = normalize_ws(before)
 
@@ -518,6 +523,8 @@ def infer_nearest_name_in_before(before: str) -> Optional[str]:
     for mm in reversed(tokens):
         cand = mm.group(1)
         if cand.lower() in NON_NAME_SINGLETONS:
+            continue
+        if _followed_by_and_cap(b, cand):
             continue
         cand2 = clean_author_candidate(cand)
         if cand2:
@@ -553,6 +560,15 @@ def resolve_author_for_quote(
     before = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
     after = scrub_attrib_context(fast_context_norm(context_after)[:CTX_WINDOW])
 
+    # 0) Prefer the reporting speaker in the lead-in clause (news attribution)
+    # "... Karoline Leavitt ... said ... “quote”" => Karoline Leavitt
+    reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before))
+    if reps:
+        cand = extract_best_person_name(reps[-1].group(1))
+        cand = clean_author_candidate(cand or "")
+        if cand:
+            return cand, "before_reporting_speaker"
+
     if re.search(r"\b(their statement|they said|the statement)\b", after, re.IGNORECASE):
         g = infer_group_author(before)
         if g:
@@ -566,6 +582,7 @@ def resolve_author_for_quote(
                 return inferred2, "after_pronoun"
             return inferred, "after_pronoun"
 
+    # generic role subject -> infer nearest named person (earlier in doc)
     if GENERIC_ROLE_SAID_RE.search(after) or GENERIC_ROLE_SAID_RE.search(before):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
@@ -583,7 +600,8 @@ def resolve_author_for_quote(
             org = infer_nearest_org_in_before(before)
             if org:
                 return org, "after_org_infer"
-            return (clean_author_candidate(last_known_author_in_paragraph or "") or default_author), "carry_or_default"
+            carry = clean_author_candidate(last_known_author_in_paragraph or "")
+            return (carry or default_author), "carry_or_default"
         return src, "after_org"
 
     m_shared = AFTER_ATTR_PATTERNS[0].search(after)
@@ -615,7 +633,8 @@ def resolve_author_for_quote(
             org = infer_nearest_org_in_before(before)
             if org:
                 return org, "before_org_infer"
-            return (clean_author_candidate(last_known_author_in_paragraph or "") or default_author), "carry_or_default"
+            carry = clean_author_candidate(last_known_author_in_paragraph or "")
+            return (carry or default_author), "carry_or_default"
         return src, "before_org"
 
     for pat in BEFORE_ATTR_PATTERNS:
@@ -1161,7 +1180,7 @@ def extract_quotes(
             author = clean_author_candidate(author) or default_author
 
             if enable_paragraph_attribution and author != default_author:
-                if author_src in {"after_name", "before_name", "after_org", "before_org", "after_shared_name", "generic_role_infer"}:
+                if author_src in {"after_name", "before_name", "after_org", "before_org", "after_shared_name", "generic_role_infer", "before_reporting_speaker"}:
                     last_author_by_para[para_i] = (author, s)
 
             for cand in candidates:
