@@ -1,3 +1,4 @@
+# app.py
 import os
 import json
 import hashlib
@@ -7,7 +8,7 @@ from collections import Counter
 import pandas as pd
 import streamlit as st
 
-from parser_core import extract_quotes, normalize_key, parse_tag_line
+from parser_core import extract_quotes, normalize_key, parse_tag_line, DEFAULT_MAX_LEN
 
 st.set_page_config(page_title="Quote Parser (JSONL)", layout="wide")
 st.title("Quote Parser")
@@ -15,6 +16,9 @@ st.caption("Upload a .txt or paste text. Curate minimal {text, author, tags[]} e
 
 DEFAULT_DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DEFAULT_JSONL_PATH = os.environ.get("JSONL_PATH", os.path.join(DEFAULT_DATA_DIR, "quotes.jsonl"))
+
+# Optional: allow deploy-time override for the UI default max length
+DEFAULT_UI_MAX_LEN = int(os.environ.get("QUOTE_MAX_LEN", str(DEFAULT_MAX_LEN)))
 
 # -----------------------------
 # Helpers
@@ -165,6 +169,7 @@ def cached_parse(
     source_text: str,
     default_author: str,
     min_len: int,
+    max_len: int,
     max_newlines: int,
     max_sentences: int,
     enable_inline_attribution: bool,
@@ -180,7 +185,7 @@ def cached_parse(
         source_text,
         default_author=default_author,
         min_len=min_len,
-        max_len=240,  # fixed
+        max_len=max_len,
         max_newlines=max_newlines,
         max_sentences=max_sentences,
         enable_inline_attribution=enable_inline_attribution,
@@ -251,8 +256,15 @@ with st.sidebar:
 
     st.subheader("Minimal quote filters")
     min_len = st.number_input("Min length", min_value=1, max_value=500, value=30)
-    st.number_input("Max length", min_value=30, max_value=240, value=240, disabled=True)
-    st.caption("Max length is fixed at 240 by design.")
+
+    max_len = st.number_input(
+        "Max length",
+        min_value=30,
+        max_value=2000,
+        value=int(DEFAULT_UI_MAX_LEN),
+        help="Default is 240. Increase if you want longer quotes; very large values may capture more noise.",
+    )
+
     max_sentences = st.number_input("Max sentences", min_value=1, max_value=10, value=6)
     max_newlines = st.number_input("Max newlines", min_value=0, max_value=10, value=1)
 
@@ -394,6 +406,7 @@ if parse_clicked:
         source_text=source_text,
         default_author=default_author,
         min_len=int(min_len),
+        max_len=int(max_len),
         max_newlines=int(max_newlines),
         max_sentences=int(max_sentences),
         enable_inline_attribution=bool(enable_inline_attribution),
