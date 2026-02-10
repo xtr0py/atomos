@@ -362,16 +362,14 @@ GENERIC_ROLE_SAID_RE = re.compile(
     re.IGNORECASE,
 )
 
-# IMPORTANT FIX:
-# Stop at ANY quote mark (open/close curly, straight, angle), so we don't match:
-# "All American Halftime Show” ... said ..."
+# IMPORTANT: stop at ANY quote mark so we don't cross a quoted title
 REPORTING_SPEAKER_BEFORE_RE = re.compile(
-    rf"({NAME_PHRASE})\s*,?[^“”\"«»]{{0,220}}?\b(?:{ATTR_VERB_RE})\b",
+    rf"({NAME_PHRASE})\s*,?[^“”\"«»]{{0,240}}?\b(?:{ATTR_VERB_RE})\b",
     re.IGNORECASE,
 )
 
 AFTER_ATTR_PATTERNS = [
-    # shared attribution after a second quote:
+    # shared attribution after a second quote
     re.compile(
         rf'^\s*(?:and|or)\s+(?:an?\s+|the\s+)?[“"](?P<q2>.+?)[”"]\s*[,–—-]?\s*(?P<n>{NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b',
         re.IGNORECASE,
@@ -385,29 +383,32 @@ AFTER_ATTR_PATTERNS = [
 ]
 
 BEFORE_ATTR_PATTERNS = [
-    re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“”\"]{{0,160}}[:;,]?\s*$", re.IGNORECASE),
-    re.compile(rf"({NAME_PHRASE})\s*,[^,\n]{{0,160}}?,\s*(?:{ATTR_VERB_RE})[^“”\"]{{0,160}}[:;,]?\s*$", re.IGNORECASE),
+    re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“”\"]{{0,200}}[:;,]?\s*$", re.IGNORECASE),
+    re.compile(rf"({NAME_PHRASE})\s*,[^,\n]{{0,200}}?,\s*(?:{ATTR_VERB_RE})[^“”\"]{{0,200}}[:;,]?\s*$", re.IGNORECASE),
 ]
 
 # Reject common capitalized singletons that are NOT people
 NON_NAME_SINGLETONS = {
+    # days/months
     "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
     "january","february","march","april","may","june","july","august","september","october","november","december",
+    # common capitalized non-names
     "times","post","reuters","ap","bbc","cnn","court","police","judge","officials","source","sources",
     "images","getty",
-    # languages / editorial tokens that show up capitalized
-    "spanish","english","american",
-    # common event/brand tokens
-    "grammy","grammys","super","bowl","apple","music",
+    # languages / common topics that show up capitalized
+    "spanish","english","french","german","italian","portuguese","arabic","chinese","russian","japanese","korean",
+    "immigration","customs","enforcement","ice",
+    # frequent event/brand tokens
+    "grammy","grammys","awards","super","bowl","halftime","show","apple","music",
 }
 
-# Reject multiword candidates whose LAST token indicates an event/title/org component
+# Reject multiword candidates whose LAST token indicates event/title/org component
 NON_PERSON_LAST_TOKENS = {
     "enforcement","department","agency","administration","committee","council",
     "office","university","hospital","ministry","commission","foundation",
     "organization","organisation","service","services",
     # event/title-ish
-    "awards","award","show","halftime","focus","language",
+    "awards","award","show","halftime","performance","language","focus",
 }
 
 TITLE_PSEUDO_NAMES = {
@@ -416,6 +417,11 @@ TITLE_PSEUDO_NAMES = {
     "the actor", "the comedian", "the athlete", "the judge", "the court",
     "president", "vice president", "senator", "governor", "mayor", "speaker", "chair",
     "commissioner", "judge", "press secretary", "spokesperson",
+}
+
+EVENT_PHRASES = {
+    "grammy awards", "the grammy awards", "super bowl", "super bowl halftime show", "halftime show",
+    "all american halftime show",
 }
 
 
@@ -438,24 +444,46 @@ def _is_title_pseudo_name(name: str) -> bool:
 
 def clean_author_candidate(a: str) -> Optional[str]:
     """
-    Normalize and reject poisoned author candidates (photo credits, pseudo-titles, event-ish phrases).
+    Final safety filter before accepting an attribution candidate.
+    Rejects languages, events, topics, photo credits, pseudo-titles, and org fragments.
     """
     if not a:
         return None
-    a = tidy_quote_text(a)
-    a = PHOTO_CREDIT_TAIL_RE.sub("", a).strip()
-    if not a:
+    n = tidy_quote_text(a)
+    n = PHOTO_CREDIT_TAIL_RE.sub("", n).strip()
+    if not n:
         return None
-    if CREDIT_WORD_RE.search(a):
+
+    low = n.lower().strip(".,;:!?")
+
+    if CREDIT_WORD_RE.search(n):
         return None
-    if _is_title_pseudo_name(a):
+    if _is_title_pseudo_name(n):
         return None
-    if _is_non_person_name(a):
+    if _is_non_person_name(n):
         return None
-    # reject single-token non-names (Spanish, Grammy, etc.)
-    if " " not in a and a.lower().strip(".") in NON_NAME_SINGLETONS:
+
+    if " " not in n and low in NON_NAME_SINGLETONS:
         return None
-    return a
+
+    for ev in EVENT_PHRASES:
+        if ev in low:
+            return None
+
+    return n
+
+
+def build_lastname_map(text: str) -> Dict[str, str]:
+    text = normalize_ws(text)
+    found: Dict[str, set] = {}
+    for m in FULLNAME_RE.finditer(text):
+        parts = [p for p in m.groups() if p]
+        if len(parts) < 2:
+            continue
+        full = " ".join(parts)
+        last = full.split()[-1].strip(".")
+        found.setdefault(last, set()).add(full)
+    return {ln: next(iter(fulls)) for ln, fulls in found.items() if len(fulls) == 1}
 
 
 def extract_best_person_name(s: str) -> Optional[str]:
@@ -477,22 +505,7 @@ def extract_best_person_name(s: str) -> Optional[str]:
     if not m:
         return None
     name = (honorific + m.group(1)).strip()
-    if len(name.split()) == 1 and name.lower().strip(".") in NON_NAME_SINGLETONS:
-        return None
     return clean_author_candidate(name)
-
-
-def build_lastname_map(text: str) -> Dict[str, str]:
-    text = normalize_ws(text)
-    found: Dict[str, set] = {}
-    for m in FULLNAME_RE.finditer(text):
-        parts = [p for p in m.groups() if p]
-        if len(parts) < 2:
-            continue
-        full = " ".join(parts)
-        last = full.split()[-1].strip(".")
-        found.setdefault(last, set()).add(full)
-    return {ln: next(iter(fulls)) for ln, fulls in found.items() if len(fulls) == 1}
 
 
 def infer_group_author(context_before: str) -> Optional[str]:
@@ -507,14 +520,14 @@ def infer_group_author(context_before: str) -> Optional[str]:
 
 
 def _followed_by_and_cap(text: str, token: str) -> bool:
-    # Helps avoid picking "Immigration" from "Immigration and Customs Enforcement"
+    # Avoid "Immigration" from "Immigration and Customs Enforcement"
     return bool(re.search(rf"\b{re.escape(token)}\s+and\s+[A-Z]", text))
 
 
 def infer_nearest_name_in_before(before: str) -> Optional[str]:
     """
     Search backward and SKIP rejected candidates.
-    Also avoids singleton tokens that are part of "X and Y ..." org phrases.
+    Also avoids singleton tokens that are part of "X and Y ..." phrases.
     """
     b = normalize_ws(before)
 
@@ -573,7 +586,13 @@ def resolve_author_for_quote(
     if reps:
         cand = extract_best_person_name(reps[-1].group(1))
         cand = clean_author_candidate(cand or "")
+        # critical: prevent "Immigration" from "Immigration and Customs ..."
+        if cand and " " not in cand and _followed_by_and_cap(before, cand):
+            cand = None
         if cand:
+            if lastname_map and len(cand.split()) == 1 and cand in lastname_map:
+                cand2 = clean_author_candidate(lastname_map[cand]) or cand
+                return cand2, "before_reporting_speaker"
             return cand, "before_reporting_speaker"
 
     if re.search(r"\b(their statement|they said|the statement)\b", after, re.IGNORECASE):
@@ -1038,11 +1057,7 @@ def ok_title_speaker(label: str) -> bool:
 def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bool:
     if not new_author:
         return False
-    if CREDIT_WORD_RE.search(new_author):
-        return False
-    if _is_title_pseudo_name(new_author):
-        return False
-    if _is_non_person_name(new_author):
+    if clean_author_candidate(new_author) is None and new_author != default_author:
         return False
     if old_author == default_author and new_author != default_author:
         return True
