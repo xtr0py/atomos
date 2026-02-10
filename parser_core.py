@@ -6,7 +6,7 @@ from bisect import bisect_right
 from typing import List, Dict, Optional, Tuple
 
 # -----------------------------
-# Tunables
+# Tunables (single source of truth)
 # -----------------------------
 
 CTX_WINDOW = 800
@@ -14,6 +14,12 @@ GROUP_CTX_WINDOW = 500
 
 # Carry-author safety: only carry forward within this many chars
 MAX_CARRY_DISTANCE = 400
+
+# Extraction defaults (editable first)
+DEFAULT_MIN_LEN = 30
+DEFAULT_MAX_LEN = 240
+DEFAULT_MAX_NEWLINES = 1
+DEFAULT_MAX_SENTENCES = 6
 
 # -----------------------------
 # Regex: normalization + small helpers
@@ -183,30 +189,16 @@ _SPEECH_HINT_RE = re.compile(
 
 def speech_like_quote(q: str) -> bool:
     """
-    Heuristic to keep actual spoken/statement-like quotes and drop many "scare quotes".
-    Keeps:
-      - quotes containing sentence punctuation (.?!)
-      - quotes with first-person / conversational markers
-    Drops:
-      - short editorial fragments that look like labels ("attacking a small business ...")
+    Optional heuristic to keep speech-like quotes and drop many scare quotes.
+    Conservative: requires either sentence punctuation or conversational markers.
     """
     t = q.strip()
     if not t:
         return False
-
-    # If it contains sentence punctuation, it's more likely speech
     if any(p in t for p in (".", "?", "!")):
         return True
-
-    # If it contains conversational markers
     if _SPEECH_HINT_RE.search(t):
         return True
-
-    # If it starts with lowercase and has no punctuation, it's often a fragment
-    if t and t[0].islower():
-        return False
-
-    # Otherwise: conservative—reject fragmenty quotes by default
     return False
 
 
@@ -225,6 +217,7 @@ TITLE_SPEAKER_LABEL_RE = re.compile(r"^\s*([A-Z][A-Za-z.'\- ]{1,40})\s*:\s*(.+?)
 BAD_SPEAKER_LABELS = {
     "Transcript", "Advertisement", "Sponsored", "Related", "Read More", "More", "Note",
     "Sign Up", "Newsletter", "Latest", "Breaking", "Update",
+    "Video", "Live", "Opinion", "Analysis", "Watch", "Listen", "Fact Check",
 }
 
 TABBED_OR_SPACED_ROW_RE = re.compile(r"\t+| {2,}")
@@ -241,6 +234,19 @@ EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
 BULLET_RE = re.compile(r"^\s*(?:[-*•‣▪]|(\d+)[.)])\s+")
 QUOTEY_LINE_RE = re.compile(r"[\"“”]")
 
+# image credit lines often pollute context/name extraction
+IMAGE_CREDIT_LINE_RE = re.compile(
+    r".+\s*[—–-]\s*(Getty Images|AP|Associated Press|Reuters|Shutterstock|AFP|Alamy)\s*$",
+    re.IGNORECASE,
+)
+PHOTO_CREDIT_TAIL_RE = re.compile(
+    r"(?:—|–|-)\s*(Getty Images|AP|Associated Press|Reuters|Shutterstock|AFP|Alamy)\b.*",
+    re.IGNORECASE,
+)
+
+def scrub_attrib_context(s: str) -> str:
+    return PHOTO_CREDIT_TAIL_RE.sub("", s)
+
 
 def looks_like_nav_line(line: str) -> bool:
     l = line.strip()
@@ -255,6 +261,8 @@ def is_noise_line(line: str) -> bool:
     if not l:
         return True
     if TIMESTAMP_ONLY_RE.match(l):
+        return True
+    if IMAGE_CREDIT_LINE_RE.match(l):
         return True
     if CHROME_RE.match(l):
         return True
@@ -335,7 +343,19 @@ BEFORE_ORG_ATTR_PATTERNS = [
     re.compile(rf"\b(the group|the agency|the department|the committee|the organization|the organisation)\s+(?:{ATTR_VERB_RE}).{{0,160}}[:;,]?\s*$", re.IGNORECASE),
 ]
 
+# generic role subjects ("the musician said") → infer nearest named person
+GENERIC_ROLE_SAID_RE = re.compile(
+    rf"\bthe (?:musician|singer|rapper|artist|actor|comedian|athlete|president|spokesperson|official|lawyer|judge)\s+(?:{ATTR_VERB_RE})\b",
+    re.IGNORECASE,
+)
+
 AFTER_ATTR_PATTERNS = [
+    # shared attribution after a second quote:
+    # “q1” and a “q2,” Trump claimed ...
+    re.compile(
+        rf'^\s*(?:and|or)\s+(?:an?\s+|the\s+)?[“"](?P<q2>.+?)[”"]\s*[,–—-]?\s*(?P<n>{NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b',
+        re.IGNORECASE,
+    ),
     re.compile(rf"^\s*[,–—-]?\s*({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
     re.compile(rf"^\s*[,–—-]?\s*(?:{ATTR_VERB_RE})\s+({NAME_PHRASE})\b", re.IGNORECASE),
     re.compile(rf"^\s*[,–—-]?\s*({ROLE_PREFIX}{NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
@@ -345,7 +365,7 @@ AFTER_ATTR_PATTERNS = [
     re.compile(r"^\s*[,–—-]?\s*(their statement|they said|the statement)\s+(continued|said)\b", re.IGNORECASE),
 ]
 
-# Key improvement: support "Name, appositive clause, said ..." before quotes
+# support "Name, appositive clause, said ..." before quotes
 BEFORE_ATTR_PATTERNS = [
     re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“\"]{{0,120}}[:;,]?\s*$", re.IGNORECASE),
     re.compile(rf"({NAME_PHRASE})\s*,[^,\n]{{0,120}}?,\s*(?:{ATTR_VERB_RE})[^“\"]{{0,120}}[:;,]?\s*$", re.IGNORECASE),
@@ -354,6 +374,14 @@ BEFORE_ATTR_PATTERNS = [
     re.compile(rf"\b({NAME_PHRASE})\s+telling\b", re.IGNORECASE),
 ]
 
+NON_NAME_SINGLETONS = {
+    # days/months
+    "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
+    "january","february","march","april","may","june","july","august","september","october","november","december",
+    # common capitalized non-names
+    "times","post","reuters","ap","bbc","cnn","court","police","judge","officials","source","sources",
+    "images","getty",
+}
 
 def extract_best_person_name(s: str) -> Optional[str]:
     s = normalize_ws(s)
@@ -367,10 +395,18 @@ def extract_best_person_name(s: str) -> Optional[str]:
     if matches:
         parts = [p for p in matches[-1].groups() if p]
         parts = [p for p in parts if p and p.lower().strip(".") not in {"de", "del", "da", "di", "la", "le", "van", "von", "der", "den", "du", "st"}]
-        return honorific + " ".join(parts).strip()
+        name = (honorific + " ".join(parts).strip()).strip()
+        if name and len(name.split()) == 1 and name.lower().strip(".") in NON_NAME_SINGLETONS:
+            return None
+        return name or None
 
     m = re.search(rf"\b({NAME_TOKEN})\b", s)
-    return (honorific + m.group(1)) if m else None
+    if not m:
+        return None
+    name = (honorific + m.group(1)).strip()
+    if len(name.split()) == 1 and name.lower().strip(".") in NON_NAME_SINGLETONS:
+        return None
+    return name
 
 
 def build_lastname_map(text: str) -> Dict[str, str]:
@@ -390,9 +426,13 @@ def infer_group_author(context_before: str) -> Optional[str]:
     ctx = fast_context_norm(context_before)[-GROUP_CTX_WINDOW:]
     m = re.search(rf"\b({NAME_TOKEN})\s+and\s+({NAME_TOKEN})\s+({NAME_TOKEN})\b", ctx)
     if m:
+        if m.group(3).lower() in NON_NAME_SINGLETONS:
+            return None
         return f"{m.group(1)} and {m.group(2)} {m.group(3)}"
     m2 = re.search(rf"\b({NAME_TOKEN})\s+and\s+({NAME_TOKEN})\b", ctx)
     if m2:
+        if m2.group(2).lower() in NON_NAME_SINGLETONS:
+            return None
         return f"{m2.group(1)} and {m2.group(2)}"
     return None
 
@@ -404,9 +444,16 @@ def infer_nearest_name_in_before(before: str) -> Optional[str]:
         parts = [p for p in matches[-1].groups() if p]
         parts = [p for p in parts if p and p.lower().strip(".") not in {"de", "del", "da", "di", "la", "le", "van", "von", "der", "den", "du", "st"}]
         cand = " ".join(parts).strip()
+        if cand and len(cand.split()) == 1 and cand.lower() in NON_NAME_SINGLETONS:
+            return None
         return cand or None
     m = re.search(rf"\b({NAME_TOKEN})\b", b)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    cand = m.group(1)
+    if cand and cand.lower() in NON_NAME_SINGLETONS:
+        return None
+    return cand
 
 
 def infer_nearest_org_in_before(before: str) -> Optional[str]:
@@ -433,8 +480,8 @@ def resolve_author_for_quote(
     lastname_map: Optional[Dict[str, str]],
     last_known_author_in_paragraph: Optional[str],
 ) -> Tuple[str, str]:
-    before = fast_context_norm(context_before)[-CTX_WINDOW:]
-    after = fast_context_norm(context_after)[:CTX_WINDOW]
+    before = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
+    after = scrub_attrib_context(fast_context_norm(context_after)[:CTX_WINDOW])
 
     if re.search(r"\b(their statement|they said|the statement)\b", after, re.IGNORECASE):
         g = infer_group_author(before)
@@ -448,6 +495,14 @@ def resolve_author_for_quote(
                 inferred = lastname_map[inferred]
             return inferred, "after_pronoun"
 
+    # generic role subject → infer nearest named person
+    if GENERIC_ROLE_SAID_RE.search(after) or GENERIC_ROLE_SAID_RE.search(before):
+        inferred = infer_nearest_name_in_before(before)
+        if inferred:
+            if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
+                inferred = lastname_map[inferred]
+            return inferred, "generic_role_infer"
+
     for pat in AFTER_ORG_ATTR_PATTERNS:
         m = pat.search(after)
         if not m:
@@ -460,7 +515,16 @@ def resolve_author_for_quote(
             return (last_known_author_in_paragraph or default_author), "carry_or_default"
         return src, "after_org"
 
-    for pat in AFTER_ATTR_PATTERNS:
+    # shared attribution after second quote (first pattern)
+    m_shared = AFTER_ATTR_PATTERNS[0].search(after)
+    if m_shared:
+        name = extract_best_person_name(m_shared.group("n"))
+        if name:
+            if lastname_map and len(name.split()) == 1 and name in lastname_map:
+                name = lastname_map[name]
+            return name, "after_shared_name"
+
+    for pat in AFTER_ATTR_PATTERNS[1:]:
         m = pat.search(after)
         if not m:
             continue
@@ -544,8 +608,11 @@ def has_quote_collection_cues(text: str) -> bool:
         return True
     if bulletish >= 2:
         return True
-    if quoted >= 2 and len(nonempty) <= 30:
+
+    # tightened: require quote-heavy short blocks (reduces news-prose false positives)
+    if len(nonempty) <= 30 and quoted >= 3 and (quoted / len(nonempty)) >= 0.5:
         return True
+
     if authorish >= 2 and len(nonempty) <= 60:
         return True
     return False
@@ -620,8 +687,10 @@ def extract_quote_collections(
 
         raw_src = raw_lines[idx]
         is_bullet = bool(BULLET_RE.match(raw_src))
-        has_quote_marks = bool(QUOTEY_LINE_RE.search(raw_src))
-        if not is_bullet and not has_quote_marks:
+
+        # tightened: only accept bullet lines or lines that START with a quote mark
+        starts_with_quote = raw_src.lstrip().startswith(("“", '"', "«", "‘", "'"))
+        if not is_bullet and not starts_with_quote:
             continue
 
         line_for_quote = BULLET_RE.sub("", raw_src).strip() if is_bullet else line
@@ -770,15 +839,27 @@ def extract_table_rows(
     for i, line in enumerate(text.splitlines()):
         if is_noise_line(line):
             continue
-        if "\t" not in line and not re.search(r" {2,}", line):
+
+        is_tab = "\t" in line
+        is_spaced = bool(re.search(r" {2,}", line))
+        if not is_tab and not is_spaced:
             continue
 
         parts = [p.strip() for p in TABBED_OR_SPACED_ROW_RE.split(line) if p.strip()]
-        if len(parts) < 2:
-            continue
+        if is_tab:
+            if len(parts) < 2:
+                continue
+        else:
+            # tightened: spaced rows require more structure
+            if len(parts) < 3:
+                continue
 
         quote_field, author_field = parts[0], parts[1]
         if not looks_like_author_field(author_field):
+            continue
+
+        # reduce false "tables" from PDF-ish spacing
+        if not re.search(r"[.!?\"“”]", quote_field):
             continue
 
         cleaned = clamp_minimal(quote_field, min_len, max_len, max_newlines, max_sentences)
@@ -845,11 +926,15 @@ def extract_inline_quote_attribution_lines(
 
 def ok_title_speaker(label: str) -> bool:
     l = label.strip()
-    if not l or l in BAD_SPEAKER_LABELS:
+    if not l:
+        return False
+    if l in BAD_SPEAKER_LABELS or l.lower() in {x.lower() for x in BAD_SPEAKER_LABELS}:
         return False
     if len(l) > 40:
         return False
     if len(l.split()) > 6:
+        return False
+    if re.search(r"\b(news|live|video|update|breaking|watch|listen|opinion|analysis)\b", l, re.IGNORECASE):
         return False
     if l.lower() in {"here’s what to know", "individual autonomy"}:
         return False
@@ -868,10 +953,10 @@ def extract_quotes(
     text: str,
     default_author: str = "Unknown",
     *,
-    min_len: int = 30,
-    max_len: int = 240,
-    max_newlines: int = 1,
-    max_sentences: int = 6,
+    min_len: int = DEFAULT_MIN_LEN,
+    max_len: int = DEFAULT_MAX_LEN,
+    max_newlines: int = DEFAULT_MAX_NEWLINES,
+    max_sentences: int = DEFAULT_MAX_SENTENCES,
     # Modes
     enable_inline_attribution: bool = True,
     enable_quoted_spans: bool = True,
@@ -946,6 +1031,12 @@ def extract_quotes(
                     existing_lower.add(str(t).lower())
             old["tags"] = old_tags
 
+        # Upgrade debug/meta fields if present
+        if record.get("_author_src") and not old.get("_author_src"):
+            old["_author_src"] = record["_author_src"]
+        if record.get("_mode") and not old.get("_mode"):
+            old["_mode"] = record["_mode"]
+
     # 1) Inline quote + attribution on the same line
     if enable_inline_attribution:
         for r in extract_inline_quote_attribution_lines(
@@ -996,7 +1087,7 @@ def extract_quotes(
             )
 
             if enable_paragraph_attribution and author and author != default_author:
-                if author_src in {"after_name", "before_name", "after_org", "before_org"}:
+                if author_src in {"after_name", "before_name", "after_org", "before_org", "after_shared_name", "generic_role_infer"}:
                     last_author_by_para[para_i] = (author, s)
 
             for cand in candidates:
@@ -1006,10 +1097,9 @@ def extract_quotes(
                 if enable_speech_filter and not speech_like_quote(cleaned):
                     continue
 
-                rec = {"text": cleaned, "author": author, "tags": [], "_pos": s}
+                rec = {"text": cleaned, "author": author, "tags": [], "_pos": s, "_author_src": author_src}
                 if include_debug:
                     rec["_mode"] = "spans"
-                    rec["_author_src"] = author_src
                 add_or_upgrade(rec)
 
     # 3) Dialogue lines (LABEL: text)
@@ -1024,6 +1114,8 @@ def extract_quotes(
             if m:
                 speaker = m.group(1).strip()
                 utterance = m.group(2).strip()
+                if not ok_title_speaker(speaker):
+                    continue
             else:
                 m2 = TITLE_SPEAKER_LABEL_RE.match(line.strip())
                 if not m2:
