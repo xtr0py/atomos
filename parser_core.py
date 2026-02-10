@@ -249,6 +249,9 @@ CREDIT_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# NEW: sentence-starter gerunds that are almost never speakers
+GERUND_SINGLE_RE = re.compile(r"^[A-Z][a-z]{2,}ing$")
+
 
 def scrub_attrib_context(s: str) -> str:
     s = PHOTO_CREDIT_SEG_RE.sub("", s)
@@ -400,6 +403,8 @@ NON_NAME_SINGLETONS = {
     "immigration","customs","enforcement","ice",
     # frequent event/brand tokens
     "grammy","grammys","awards","super","bowl","halftime","show","apple","music",
+    # NEW: sentence-starter verbs/gerunds
+    "calling","saying","asking","warning","noting","adding","explaining",
 }
 
 # Reject multiword candidates whose LAST token indicates event/title/org component
@@ -445,10 +450,12 @@ def _is_title_pseudo_name(name: str) -> bool:
 def clean_author_candidate(a: str) -> Optional[str]:
     """
     Final safety filter before accepting an attribution candidate.
-    Rejects languages, events, topics, photo credits, pseudo-titles, and org fragments.
+    Rejects languages, events, topics, photo credits, pseudo-titles, org fragments,
+    and sentence-starter gerunds like "Calling".
     """
     if not a:
         return None
+
     n = tidy_quote_text(a)
     n = PHOTO_CREDIT_TAIL_RE.sub("", n).strip()
     if not n:
@@ -456,16 +463,27 @@ def clean_author_candidate(a: str) -> Optional[str]:
 
     low = n.lower().strip(".,;:!?")
 
+    # Photo/media credit contamination
     if CREDIT_WORD_RE.search(n):
         return None
+
+    # Bare titles / roles
     if _is_title_pseudo_name(n):
         return None
+
+    # Event/org-ish multiword
     if _is_non_person_name(n):
         return None
 
+    # Single-token reject list (topics/languages/etc)
     if " " not in n and low in NON_NAME_SINGLETONS:
         return None
 
+    # NEW: reject gerund-y single tokens ("Calling", "Saying", etc)
+    if " " not in n and GERUND_SINGLE_RE.match(n) and low not in {"king"}:
+        return None
+
+    # Event phrases anywhere
     for ev in EVENT_PHRASES:
         if ev in low:
             return None
@@ -586,7 +604,7 @@ def resolve_author_for_quote(
     if reps:
         cand = extract_best_person_name(reps[-1].group(1))
         cand = clean_author_candidate(cand or "")
-        # critical: prevent "Immigration" from "Immigration and Customs ..."
+        # prevent "Immigration" from "Immigration and Customs ..."
         if cand and " " not in cand and _followed_by_and_cap(before, cand):
             cand = None
         if cand:
@@ -1051,6 +1069,9 @@ def ok_title_speaker(label: str) -> bool:
     if len(l.split()) > 6:
         return False
     if CREDIT_WORD_RE.search(l):
+        return False
+    # avoid obvious gerund-y pseudo-speakers in transcripts
+    if " " not in l and GERUND_SINGLE_RE.match(l):
         return False
     return True
 
