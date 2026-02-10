@@ -362,16 +362,16 @@ GENERIC_ROLE_SAID_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Prefer the reporting speaker in the lead-in clause (news pattern):
-# "... Karoline Leavitt, when asked..., said she thought ... “quote”"
+# IMPORTANT FIX:
+# Stop at ANY quote mark (open/close curly, straight, angle), so we don't match:
+# "All American Halftime Show” ... said ..."
 REPORTING_SPEAKER_BEFORE_RE = re.compile(
-    rf"({NAME_PHRASE})\s*,?[^“\"]{{0,220}}?\b(?:{ATTR_VERB_RE})\b",
+    rf"({NAME_PHRASE})\s*,?[^“”\"«»]{{0,220}}?\b(?:{ATTR_VERB_RE})\b",
     re.IGNORECASE,
 )
 
 AFTER_ATTR_PATTERNS = [
     # shared attribution after a second quote:
-    # “q1” and a “q2,” Trump claimed ...
     re.compile(
         rf'^\s*(?:and|or)\s+(?:an?\s+|the\s+)?[“"](?P<q2>.+?)[”"]\s*[,–—-]?\s*(?P<n>{NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b',
         re.IGNORECASE,
@@ -385,30 +385,35 @@ AFTER_ATTR_PATTERNS = [
 ]
 
 BEFORE_ATTR_PATTERNS = [
-    re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“\"]{{0,160}}[:;,]?\s*$", re.IGNORECASE),
-    re.compile(rf"({NAME_PHRASE})\s*,[^,\n]{{0,160}}?,\s*(?:{ATTR_VERB_RE})[^“\"]{{0,160}}[:;,]?\s*$", re.IGNORECASE),
+    re.compile(rf"({NAME_PHRASE})\s+(?:{ATTR_VERB_RE})[^“”\"]{{0,160}}[:;,]?\s*$", re.IGNORECASE),
+    re.compile(rf"({NAME_PHRASE})\s*,[^,\n]{{0,160}}?,\s*(?:{ATTR_VERB_RE})[^“”\"]{{0,160}}[:;,]?\s*$", re.IGNORECASE),
 ]
 
+# Reject common capitalized singletons that are NOT people
 NON_NAME_SINGLETONS = {
     "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
     "january","february","march","april","may","june","july","august","september","october","november","december",
     "times","post","reuters","ap","bbc","cnn","court","police","judge","officials","source","sources",
     "images","getty",
+    # languages / editorial tokens that show up capitalized
+    "spanish","english","american",
+    # common event/brand tokens
+    "grammy","grammys","super","bowl","apple","music",
 }
 
+# Reject multiword candidates whose LAST token indicates an event/title/org component
 NON_PERSON_LAST_TOKENS = {
     "enforcement","department","agency","administration","committee","council",
     "office","university","hospital","ministry","commission","foundation",
     "organization","organisation","service","services",
+    # event/title-ish
+    "awards","award","show","halftime","focus","language",
 }
 
 TITLE_PSEUDO_NAMES = {
-    # with "the"
     "the president", "the vice president", "the white house", "the administration", "the government",
     "the spokesperson", "the press secretary", "the musician", "the singer", "the rapper", "the artist",
     "the actor", "the comedian", "the athlete", "the judge", "the court",
-
-    # bare titles (so “President” doesn’t become an author)
     "president", "vice president", "senator", "governor", "mayor", "speaker", "chair",
     "commissioner", "judge", "press secretary", "spokesperson",
 }
@@ -433,7 +438,7 @@ def _is_title_pseudo_name(name: str) -> bool:
 
 def clean_author_candidate(a: str) -> Optional[str]:
     """
-    Normalize and reject poisoned author candidates (photo credits, title pseudo-names, org-ish endings).
+    Normalize and reject poisoned author candidates (photo credits, pseudo-titles, event-ish phrases).
     """
     if not a:
         return None
@@ -446,6 +451,9 @@ def clean_author_candidate(a: str) -> Optional[str]:
     if _is_title_pseudo_name(a):
         return None
     if _is_non_person_name(a):
+        return None
+    # reject single-token non-names (Spanish, Grammy, etc.)
+    if " " not in a and a.lower().strip(".") in NON_NAME_SINGLETONS:
         return None
     return a
 
@@ -505,7 +513,7 @@ def _followed_by_and_cap(text: str, token: str) -> bool:
 
 def infer_nearest_name_in_before(before: str) -> Optional[str]:
     """
-    Search backward and SKIP rejected candidates (org-ish endings, titles, credits).
+    Search backward and SKIP rejected candidates.
     Also avoids singleton tokens that are part of "X and Y ..." org phrases.
     """
     b = normalize_ws(before)
@@ -522,7 +530,7 @@ def infer_nearest_name_in_before(before: str) -> Optional[str]:
     tokens = list(re.finditer(rf"\b({NAME_TOKEN})\b", b))
     for mm in reversed(tokens):
         cand = mm.group(1)
-        if cand.lower() in NON_NAME_SINGLETONS:
+        if cand.lower().strip(".") in NON_NAME_SINGLETONS:
             continue
         if _followed_by_and_cap(b, cand):
             continue
@@ -560,8 +568,7 @@ def resolve_author_for_quote(
     before = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
     after = scrub_attrib_context(fast_context_norm(context_after)[:CTX_WINDOW])
 
-    # 0) Prefer the reporting speaker in the lead-in clause (news attribution)
-    # "... Karoline Leavitt ... said ... “quote”" => Karoline Leavitt
+    # 0) Prefer reporting speaker in lead-in clause (news attribution)
     reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before))
     if reps:
         cand = extract_best_person_name(reps[-1].group(1))
@@ -582,7 +589,6 @@ def resolve_author_for_quote(
                 return inferred2, "after_pronoun"
             return inferred, "after_pronoun"
 
-    # generic role subject -> infer nearest named person (earlier in doc)
     if GENERIC_ROLE_SAID_RE.search(after) or GENERIC_ROLE_SAID_RE.search(before):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
@@ -911,6 +917,8 @@ def looks_like_author_field(field: str) -> bool:
         return False
     if _is_title_pseudo_name(f):
         return False
+    if _is_non_person_name(f):
+        return False
     return f.lower() not in {"english", "french", "spanish", "german"}
 
 def extract_table_rows(
@@ -1033,6 +1041,8 @@ def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bo
     if CREDIT_WORD_RE.search(new_author):
         return False
     if _is_title_pseudo_name(new_author):
+        return False
+    if _is_non_person_name(new_author):
         return False
     if old_author == default_author and new_author != default_author:
         return True
@@ -1180,7 +1190,10 @@ def extract_quotes(
             author = clean_author_candidate(author) or default_author
 
             if enable_paragraph_attribution and author != default_author:
-                if author_src in {"after_name", "before_name", "after_org", "before_org", "after_shared_name", "generic_role_infer", "before_reporting_speaker"}:
+                if author_src in {
+                    "after_name", "before_name", "after_org", "before_org",
+                    "after_shared_name", "generic_role_infer", "before_reporting_speaker"
+                }:
                     last_author_by_para[para_i] = (author, s)
 
             for cand in candidates:
