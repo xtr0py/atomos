@@ -244,8 +244,21 @@ PHOTO_CREDIT_TAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Remove entire "Name — Getty Images" segments from context (prevents Kevin Sabitus being treated as speaker)
+PHOTO_CREDIT_SEG_RE = re.compile(
+    r"\b[A-Z][A-Za-z.'\- ]{1,60}\s*[—–-]\s*(Getty Images|AP|Associated Press|Reuters|Shutterstock|AFP|Alamy)\b",
+    re.IGNORECASE,
+)
+
+CREDIT_WORD_RE = re.compile(
+    r"\b(getty|reuters|associated press|ap|afp|alamy|shutterstock)\b",
+    re.IGNORECASE,
+)
+
 def scrub_attrib_context(s: str) -> str:
-    return PHOTO_CREDIT_TAIL_RE.sub("", s)
+    s = PHOTO_CREDIT_SEG_RE.sub("", s)
+    s = PHOTO_CREDIT_TAIL_RE.sub("", s)
+    return s
 
 
 def looks_like_nav_line(line: str) -> bool:
@@ -360,7 +373,10 @@ AFTER_ATTR_PATTERNS = [
     re.compile(rf"^\s*[,–—-]?\s*(?:{ATTR_VERB_RE})\s+({NAME_PHRASE})\b", re.IGNORECASE),
     re.compile(rf"^\s*[,–—-]?\s*({ROLE_PREFIX}{NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
     re.compile(rf"^\s*[,–—-]?\s*({NAME_PHRASE})\s*,[^.]*?\b(?:{ATTR_VERB_RE})\b", re.IGNORECASE),
-    re.compile(rf"^\s*[,–—-]?\s*[—–-]\s*({NAME_PHRASE})\b", re.IGNORECASE),
+
+    # IMPORTANT: removed dash-name pattern here to avoid photographer credits (e.g., “...”— Kevin Sabitus)
+    # re.compile(rf"^\s*[,–—-]?\s*[—–-]\s*({NAME_PHRASE})\b", re.IGNORECASE),
+
     re.compile(rf"^\s*[,–—-]?\s*[—–-]\s*({ORG_PHRASE_RE.pattern})\b", re.IGNORECASE),
     re.compile(r"^\s*[,–—-]?\s*(their statement|they said|the statement)\s+(continued|said)\b", re.IGNORECASE),
 ]
@@ -383,6 +399,35 @@ NON_NAME_SINGLETONS = {
     "images","getty",
 }
 
+NON_PERSON_LAST_TOKENS = {
+    "enforcement", "department", "agency", "administration", "committee", "council",
+    "office", "university", "hospital", "ministry", "commission", "foundation",
+    "organization", "organisation", "service", "services",
+}
+
+def _is_non_person_name(name: str) -> bool:
+    parts = [p.strip(".") for p in name.split() if p.strip(".")]
+    if not parts:
+        return True
+    last = parts[-1].lower()
+    return last in NON_PERSON_LAST_TOKENS
+
+
+def clean_author_candidate(a: str) -> Optional[str]:
+    """
+    Normalize and reject poisoned author candidates (photo credits, etc.)
+    """
+    if not a:
+        return None
+    a = tidy_quote_text(a)
+    a = PHOTO_CREDIT_TAIL_RE.sub("", a).strip()
+    if not a:
+        return None
+    if CREDIT_WORD_RE.search(a):
+        return None
+    return a
+
+
 def extract_best_person_name(s: str) -> Optional[str]:
     s = normalize_ws(s)
     honorific = ""
@@ -398,6 +443,10 @@ def extract_best_person_name(s: str) -> Optional[str]:
         name = (honorific + " ".join(parts).strip()).strip()
         if name and len(name.split()) == 1 and name.lower().strip(".") in NON_NAME_SINGLETONS:
             return None
+        if name and _is_non_person_name(name):
+            return None
+        if name and CREDIT_WORD_RE.search(name):
+            return None
         return name or None
 
     m = re.search(rf"\b({NAME_TOKEN})\b", s)
@@ -405,6 +454,10 @@ def extract_best_person_name(s: str) -> Optional[str]:
         return None
     name = (honorific + m.group(1)).strip()
     if len(name.split()) == 1 and name.lower().strip(".") in NON_NAME_SINGLETONS:
+        return None
+    if name and _is_non_person_name(name):
+        return None
+    if name and CREDIT_WORD_RE.search(name):
         return None
     return name
 
@@ -446,12 +499,20 @@ def infer_nearest_name_in_before(before: str) -> Optional[str]:
         cand = " ".join(parts).strip()
         if cand and len(cand.split()) == 1 and cand.lower() in NON_NAME_SINGLETONS:
             return None
+        if cand and _is_non_person_name(cand):
+            return None
+        if cand and CREDIT_WORD_RE.search(cand):
+            return None
         return cand or None
     m = re.search(rf"\b({NAME_TOKEN})\b", b)
     if not m:
         return None
     cand = m.group(1)
     if cand and cand.lower() in NON_NAME_SINGLETONS:
+        return None
+    if cand and _is_non_person_name(cand):
+        return None
+    if cand and CREDIT_WORD_RE.search(cand):
         return None
     return cand
 
@@ -486,14 +547,17 @@ def resolve_author_for_quote(
     if re.search(r"\b(their statement|they said|the statement)\b", after, re.IGNORECASE):
         g = infer_group_author(before)
         if g:
-            return g, "group_infer"
+            a = clean_author_candidate(g)
+            return (a or default_author), "group_infer"
 
     if PRONOUN_AFTER_RE.search(after):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
             if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
                 inferred = lastname_map[inferred]
-            return inferred, "after_pronoun"
+            a = clean_author_candidate(inferred)
+            if a:
+                return a, "after_pronoun"
 
     # generic role subject → infer nearest named person
     if GENERIC_ROLE_SAID_RE.search(after) or GENERIC_ROLE_SAID_RE.search(before):
@@ -501,19 +565,25 @@ def resolve_author_for_quote(
         if inferred:
             if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
                 inferred = lastname_map[inferred]
-            return inferred, "generic_role_infer"
+            a = clean_author_candidate(inferred)
+            if a:
+                return a, "generic_role_infer"
 
     for pat in AFTER_ORG_ATTR_PATTERNS:
         m = pat.search(after)
         if not m:
             continue
         src = m.group(1).strip()
-        if src.lower() in GENERIC_ORG_WORDS:
+        a = clean_author_candidate(src)
+        if not a:
+            continue
+        if a.lower() in GENERIC_ORG_WORDS:
             org = infer_nearest_org_in_before(before)
+            org = clean_author_candidate(org or "")
             if org:
                 return org, "after_org_infer"
             return (last_known_author_in_paragraph or default_author), "carry_or_default"
-        return src, "after_org"
+        return a, "after_org"
 
     # shared attribution after second quote (first pattern)
     m_shared = AFTER_ATTR_PATTERNS[0].search(after)
@@ -522,7 +592,9 @@ def resolve_author_for_quote(
         if name:
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name = lastname_map[name]
-            return name, "after_shared_name"
+            a = clean_author_candidate(name)
+            if a:
+                return a, "after_shared_name"
 
     for pat in AFTER_ATTR_PATTERNS[1:]:
         m = pat.search(after)
@@ -537,19 +609,25 @@ def resolve_author_for_quote(
             name = name.split(",")[0].strip()
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name = lastname_map[name]
-            return name, "after_name"
+            a = clean_author_candidate(name)
+            if a:
+                return a, "after_name"
 
     for pat in BEFORE_ORG_ATTR_PATTERNS:
         m = pat.search(before)
         if not m:
             continue
         src = m.group(1).strip()
-        if src.lower() in GENERIC_ORG_WORDS:
+        a = clean_author_candidate(src)
+        if not a:
+            continue
+        if a.lower() in GENERIC_ORG_WORDS:
             org = infer_nearest_org_in_before(before)
+            org = clean_author_candidate(org or "")
             if org:
                 return org, "before_org_infer"
             return (last_known_author_in_paragraph or default_author), "carry_or_default"
-        return src, "before_org"
+        return a, "before_org"
 
     for pat in BEFORE_ATTR_PATTERNS:
         m = pat.search(before)
@@ -561,9 +639,14 @@ def resolve_author_for_quote(
             name = name.split(",")[0].strip()
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name = lastname_map[name]
-            return name, "before_name"
+            a = clean_author_candidate(name)
+            if a:
+                return a, "before_name"
 
-    return (last_known_author_in_paragraph or default_author), "carry_or_default"
+    carry = clean_author_candidate(last_known_author_in_paragraph or "")
+    if carry:
+        return carry, "carry_or_default"
+    return default_author, "carry_or_default"
 
 
 # -----------------------------
@@ -655,7 +738,8 @@ def extract_quote_collections(
         cleaned = clamp_minimal(qtext, min_len, max_len, max_newlines, max_sentences)
         if not cleaned:
             return
-        rec = {"text": cleaned, "author": author or default_author, "tags": [], "_pos": pos}
+        author_clean = clean_author_candidate(author or "") or default_author
+        rec = {"text": cleaned, "author": author_clean, "tags": [], "_pos": pos}
         if include_debug:
             rec["_mode"] = "collections"
         results.append(rec)
@@ -673,16 +757,19 @@ def extract_quote_collections(
 
         m_attr = ATTRIBUTION_LINE_RE.match(line)
         if m_attr and last_entry_index is not None:
-            author = tidy_quote_text(m_attr.group(1))
-            results[last_entry_index]["author"] = author
-            current_author = author
+            author = clean_author_candidate(m_attr.group(1)) or None
+            if author:
+                results[last_entry_index]["author"] = author
+                current_author = author
             continue
 
         if NUMBER_HEADER_RE.match(line):
             continue
 
         if is_author_line_candidate(line):
-            current_author = tidy_quote_text(line)
+            a = clean_author_candidate(line)
+            if a:
+                current_author = a
             continue
 
         raw_src = raw_lines[idx]
@@ -822,6 +909,8 @@ def looks_like_author_field(field: str) -> bool:
         return False
     if not re.search(rf"\b{NAME_TOKEN}\b", f):
         return False
+    if CREDIT_WORD_RE.search(f):
+        return False
     return f.lower() not in {"english", "french", "spanish", "german"}
 
 def extract_table_rows(
@@ -866,7 +955,8 @@ def extract_table_rows(
         if not cleaned:
             continue
 
-        rec = {"text": cleaned, "author": tidy_quote_text(author_field), "tags": [], "_pos": line_starts[i]}
+        author_clean = clean_author_candidate(author_field) or default_author
+        rec = {"text": cleaned, "author": author_clean, "tags": [], "_pos": line_starts[i]}
         if include_debug:
             rec["_mode"] = "tables"
         results.append(rec)
@@ -905,7 +995,8 @@ def extract_inline_quote_attribution_lines(
 
         q_raw = m.group("q")
         candidates = chunk_quote_to_maxlen(q_raw, max_len=max_len) if len(tidy_quote_text(q_raw)) > max_len else [q_raw]
-        author = tidy_quote_text(m.group("a") or m.group("a2") or default_author)
+        author_raw = m.group("a") or m.group("a2") or default_author
+        author = clean_author_candidate(author_raw) or default_author
 
         for c in candidates:
             qt = clamp_minimal(c, min_len, max_len, max_newlines, max_sentences)
@@ -938,10 +1029,14 @@ def ok_title_speaker(label: str) -> bool:
         return False
     if l.lower() in {"here’s what to know", "individual autonomy"}:
         return False
+    if CREDIT_WORD_RE.search(l):
+        return False
     return True
 
 def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bool:
     if not new_author:
+        return False
+    if CREDIT_WORD_RE.search(new_author):
         return False
     if old_author == default_author and new_author != default_author:
         return True
@@ -1086,6 +1181,8 @@ def extract_quotes(
                 last_known_author_in_paragraph=carry_author,
             )
 
+            author = clean_author_candidate(author) or default_author
+
             if enable_paragraph_attribution and author and author != default_author:
                 if author_src in {"after_name", "before_name", "after_org", "before_org", "after_shared_name", "generic_role_infer"}:
                     last_author_by_para[para_i] = (author, s)
@@ -1131,7 +1228,8 @@ def extract_quotes(
             if enable_speech_filter and not speech_like_quote(cleaned):
                 continue
 
-            rec = {"text": cleaned, "author": speaker, "tags": [], "_pos": line_starts[i]}
+            speaker_clean = clean_author_candidate(speaker) or speaker
+            rec = {"text": cleaned, "author": speaker_clean, "tags": [], "_pos": line_starts[i]}
             if include_debug:
                 rec["_mode"] = "dialogue"
             add_or_upgrade(rec)
@@ -1186,7 +1284,9 @@ def extract_quotes(
         if m_attr:
             j = prev_index(pos)
             if j is not None and str(results[j].get("author", default_author)) == default_author:
-                results[j]["author"] = tidy_quote_text(m_attr.group(1))
+                a = clean_author_candidate(m_attr.group(1))
+                if a:
+                    results[j]["author"] = a
 
     if include_debug:
         return [
