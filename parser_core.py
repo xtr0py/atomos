@@ -194,6 +194,14 @@ def stable_group_id(seed: str) -> str:
     return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
+# NEW: strip quoted segments so name inference doesn't grab names from prior quotes
+_QUOTED_SEG_RE = re.compile(r"[“\"«].+?[”\"»]", re.DOTALL)
+
+
+def strip_quoted_segments(s: str) -> str:
+    return _QUOTED_SEG_RE.sub(" ", s)
+
+
 # -----------------------------
 # Speech-like / scare-quote filtering
 # -----------------------------
@@ -390,6 +398,16 @@ REPORTING_SPEAKER_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# NEW: spokesperson / office attribution (prevents "Polis" being treated as speaker)
+SPOKESPERSON_FOR_OFFICE_RE = re.compile(
+    rf"\b(?:a\s+)?spokesperson\s+for\s+({NAME_PHRASE})\s*'?\s*office\b.*?\b(?:{ATTR_VERB_RE})\b",
+    re.IGNORECASE,
+)
+OFFICE_SAID_RE = re.compile(
+    rf"\b({NAME_PHRASE})'s\s+office\s+(?:{ATTR_VERB_RE})\b",
+    re.IGNORECASE,
+)
+
 AFTER_ATTR_PATTERNS = [
     # shared attribution after a second quote
     re.compile(
@@ -432,6 +450,7 @@ DOC_TITLE_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9&.\-']+(?:\s+[A-Z][A-Za-z0-9&.\-']+){0,10}\s+(?:Report|Study|Paper|Review|Analysis|Audit))\b"
 )
 
+
 def infer_document_title(context_before: str, context_after: str) -> Optional[str]:
     before = fast_context_norm(context_before)[-CTX_WINDOW:]
     after = fast_context_norm(context_after)[:CTX_WINDOW]
@@ -443,6 +462,7 @@ def infer_document_title(context_before: str, context_after: str) -> Optional[st
     if m2:
         return m2.group(1)
     return None
+
 
 def normalize_doc_subject(subject: str, context_before: str, context_after: str) -> str:
     title = infer_document_title(context_before, context_after)
@@ -459,21 +479,28 @@ def normalize_doc_subject(subject: str, context_before: str, context_after: str)
 # -----------------------------
 
 NON_NAME_SINGLETONS = {
-    "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
-    "january","february","march","april","may","june","july","august","september","october","november","december",
-    "times","post","reuters","ap","bbc","cnn","court","police","judge","officials","source","sources",
-    "images","getty",
-    "spanish","english","french","german","italian","portuguese","arabic","chinese","russian","japanese","korean",
-    "immigration","customs","enforcement","ice",
-    "grammy","grammys","awards","super","bowl","halftime","show","apple","music",
-    "calling","saying","asking","warning","noting","adding","explaining",
+    # days/months
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+    # determiners (prevent "The")
+    "the", "a", "an",
+    # common capitalized non-names
+    "times", "post", "reuters", "ap", "bbc", "cnn", "court", "police", "judge", "officials", "source", "sources",
+    "images", "getty",
+    # languages / common topics
+    "spanish", "english", "french", "german", "italian", "portuguese", "arabic", "chinese", "russian", "japanese", "korean",
+    "immigration", "customs", "enforcement", "ice",
+    # frequent event/brand tokens
+    "grammy", "grammys", "awards", "super", "bowl", "halftime", "show", "apple", "music",
+    # sentence-starter verbs/gerunds
+    "calling", "saying", "asking", "warning", "noting", "adding", "explaining",
 }
 
 NON_PERSON_LAST_TOKENS = {
-    "enforcement","department","agency","administration","committee","council",
-    "office","university","hospital","ministry","commission","foundation",
-    "organization","organisation","service","services",
-    "awards","award","show","halftime","performance","language","focus",
+    "enforcement", "department", "agency", "administration", "committee", "council",
+    "office", "university", "hospital", "ministry", "commission", "foundation",
+    "organization", "organisation", "service", "services",
+    "awards", "award", "show", "halftime", "performance", "language", "focus",
 }
 
 TITLE_PSEUDO_NAMES = {
@@ -489,12 +516,14 @@ EVENT_PHRASES = {
     "all american halftime show",
 }
 
+
 def _is_non_person_name(name: str) -> bool:
     parts = [p.strip(".") for p in name.split() if p.strip(".")]
     if not parts:
         return True
     last = parts[-1].lower()
     return last in NON_PERSON_LAST_TOKENS
+
 
 def _is_title_pseudo_name(name: str) -> bool:
     n = normalize_ws(name).lower()
@@ -504,15 +533,21 @@ def _is_title_pseudo_name(name: str) -> bool:
         return n[4:] in TITLE_PSEUDO_NAMES
     return False
 
+
 def clean_author_candidate(a: str) -> Optional[str]:
     if not a:
         return None
+
     n = tidy_quote_text(a)
     n = PHOTO_CREDIT_TAIL_RE.sub("", n).strip()
     if not n:
         return None
 
     low = n.lower().strip(".,;:!?")
+
+    # Never accept bare determiners as "names"
+    if " " not in n and low in {"the", "a", "an"}:
+        return None
 
     if CREDIT_WORD_RE.search(n):
         return None
@@ -529,6 +564,7 @@ def clean_author_candidate(a: str) -> Optional[str]:
             return None
     return n
 
+
 def build_lastname_map(text: str) -> Dict[str, str]:
     text = normalize_ws(text)
     found: Dict[str, set] = {}
@@ -541,6 +577,7 @@ def build_lastname_map(text: str) -> Dict[str, str]:
         found.setdefault(last, set()).add(full)
     return {ln: next(iter(fulls)) for ln, fulls in found.items() if len(fulls) == 1}
 
+
 def extract_best_person_name(s: str) -> Optional[str]:
     s = normalize_ws(s)
     honorific = ""
@@ -552,7 +589,7 @@ def extract_best_person_name(s: str) -> Optional[str]:
     matches = list(FULLNAME_RE.finditer(s))
     if matches:
         parts = [p for p in matches[-1].groups() if p]
-        parts = [p for p in parts if p and p.lower().strip(".") not in {"de","del","da","di","la","le","van","von","der","den","du","st"}]
+        parts = [p for p in parts if p and p.lower().strip(".") not in {"de", "del", "da", "di", "la", "le", "van", "von", "der", "den", "du", "st"}]
         name = (honorific + " ".join(parts).strip()).strip()
         return clean_author_candidate(name)
 
@@ -560,7 +597,10 @@ def extract_best_person_name(s: str) -> Optional[str]:
     if not m:
         return None
     name = (honorific + m.group(1)).strip()
+    if name.lower().strip(".") in {"the", "a", "an"}:
+        return None
     return clean_author_candidate(name)
+
 
 def infer_group_author(context_before: str) -> Optional[str]:
     ctx = fast_context_norm(context_before)[-GROUP_CTX_WINDOW:]
@@ -572,16 +612,23 @@ def infer_group_author(context_before: str) -> Optional[str]:
         return clean_author_candidate(f"{m2.group(1)} and {m2.group(2)}")
     return None
 
+
 def _followed_by_and_cap(text: str, token: str) -> bool:
     return bool(re.search(rf"\b{re.escape(token)}\s+and\s+[A-Z]", text))
 
+
 def infer_nearest_name_in_before(before: str) -> Optional[str]:
-    b = normalize_ws(before)
+    """
+    Search backward and SKIP rejected candidates.
+    Also avoids singleton tokens that are part of "X and Y ..." phrases.
+    Also strips quoted segments to avoid picking names from earlier quotes.
+    """
+    b = normalize_ws(strip_quoted_segments(before))
 
     matches = list(FULLNAME_RE.finditer(b))
     for mm in reversed(matches):
         parts = [p for p in mm.groups() if p]
-        parts = [p for p in parts if p and p.lower().strip(".") not in {"de","del","da","di","la","le","van","von","der","den","du","st"}]
+        parts = [p for p in parts if p and p.lower().strip(".") not in {"de", "del", "da", "di", "la", "le", "van", "von", "der", "den", "du", "st"}]
         cand = " ".join(parts).strip()
         cand2 = clean_author_candidate(cand)
         if cand2:
@@ -597,7 +644,9 @@ def infer_nearest_name_in_before(before: str) -> Optional[str]:
         cand2 = clean_author_candidate(cand)
         if cand2:
             return cand2
+
     return None
+
 
 def infer_nearest_org_in_before(before: str) -> Optional[str]:
     b = normalize_ws(before)
@@ -605,6 +654,7 @@ def infer_nearest_org_in_before(before: str) -> Optional[str]:
     if ms:
         return ms[-1].group(1).strip()
     return None
+
 
 def _looks_like_quoted_title(before: str, quote: str) -> bool:
     q = quote.strip()
@@ -625,11 +675,33 @@ def resolve_author_for_quote(
     before = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
     after = scrub_attrib_context(fast_context_norm(context_after)[:CTX_WINDOW])
 
-    # 0) Prefer reporting speaker in lead-in clause (news attribution)
+    # 0) Office/spokesperson attribution must override person-name heuristics
+    m_off = OFFICE_SAID_RE.search(before)
+    if m_off:
+        who = extract_best_person_name(m_off.group(1)) or normalize_ws(m_off.group(1))
+        who = clean_author_candidate(who) or who
+        if who:
+            return f"{who}'s office", "before_office"
+
+    m_sp = SPOKESPERSON_FOR_OFFICE_RE.search(before)
+    if m_sp:
+        who = extract_best_person_name(m_sp.group(1)) or normalize_ws(m_sp.group(1))
+        who = clean_author_candidate(who) or who
+        if who:
+            return f"{who}'s office", "before_office"
+
+    # 0.25) Prefer reporting speaker in lead-in clause (news attribution)
     reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before))
+    if reps:
+        # Guard: don't treat "spokesperson for X's office..." as X speaking
+        tail = before[-240:].lower()
+        if "spokesperson for" in tail or "'s office" in tail:
+            reps = []
+
     if reps:
         cand = extract_best_person_name(reps[-1].group(1))
         cand = clean_author_candidate(cand or "")
+        # prevent "Immigration" from "Immigration and Customs ..."
         if cand and " " not in cand and _followed_by_and_cap(before, cand):
             cand = None
         if cand:
@@ -757,6 +829,7 @@ def is_author_line_candidate(line: str) -> bool:
         return False
     return bool(re.search(rf"\b{NAME_TOKEN}\b", line))
 
+
 def has_quote_collection_cues(text: str) -> bool:
     nonempty = [l.rstrip() for l in text.splitlines() if l.strip()]
     if len(nonempty) < 2:
@@ -766,6 +839,7 @@ def has_quote_collection_cues(text: str) -> bool:
     attributions = sum(1 for l in nonempty if ATTRIBUTION_LINE_RE.match(l.strip()))
     tags = sum(1 for l in nonempty if GOODREADS_TAGS_RE.match(l.strip()))
     quoted = sum(1 for l in nonempty if QUOTEY_LINE_RE.search(l))
+
     authorish = sum(1 for l in nonempty if is_author_line_candidate(l))
 
     if tags > 0 or attributions > 0:
@@ -777,6 +851,7 @@ def has_quote_collection_cues(text: str) -> bool:
     if authorish >= 2 and len(nonempty) <= 60:
         return True
     return False
+
 
 def parse_tag_line(tag_line: str) -> List[str]:
     seen = set()
@@ -790,6 +865,7 @@ def parse_tag_line(tag_line: str) -> List[str]:
         seen.add(k)
         out.append(t)
     return out
+
 
 def extract_quote_collections(
     text: str,
@@ -867,12 +943,14 @@ def extract_quote_collections(
 
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
 
+
 def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
     spans: List[Tuple[int, int]] = []
     for p_start, p_end in _paragraph_ranges(text):
         spans.extend(_scan_quote_spans_in_block(text, p_start, p_end))
     spans.sort(key=lambda x: (x[0], x[1]))
     return _outermost_intervals(spans)
+
 
 def _paragraph_ranges(text: str) -> List[Tuple[int, int]]:
     ranges: List[Tuple[int, int]] = []
@@ -885,6 +963,7 @@ def _paragraph_ranges(text: str) -> List[Tuple[int, int]]:
     if start < len(text):
         ranges.append((start, len(text)))
     return ranges
+
 
 def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[int, int]]:
     out: List[Tuple[int, int]] = []
@@ -922,14 +1001,16 @@ def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[in
         ch = text[i]
 
         if ch == "“":
-            curly_stack.append(i); continue
+            curly_stack.append(i)
+            continue
         if ch == "”":
             if curly_stack:
                 out.append((curly_stack.pop(), i))
             continue
 
         if ch == "«":
-            angle_stack.append(i); continue
+            angle_stack.append(i)
+            continue
         if ch == "»":
             if angle_stack:
                 out.append((angle_stack.pop(), i))
@@ -951,6 +1032,7 @@ def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[in
         straight_stack.append(i)
 
     return out
+
 
 def _outermost_intervals(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     if not spans:
@@ -989,6 +1071,7 @@ def looks_like_author_field(field: str) -> bool:
     if _is_non_person_name(f):
         return False
     return f.lower() not in {"english", "french", "spanish", "german"}
+
 
 def extract_table_rows(
     text: str,
@@ -1046,6 +1129,7 @@ def extract_table_rows(
 INLINE_QUOTE_ATTR_RE = re.compile(
     r'^\s*[“"](?P<q>.+?)[”"]\s*(?:[—–-]\s*(?P<a>[^,\n]{2,120})|[(\[]\s*(?P<a2>[^)\]\n]{2,120})\s*[)\]])\s*$'
 )
+
 
 def extract_inline_quote_attribution_lines(
     raw: str,
@@ -1119,11 +1203,16 @@ def ok_title_speaker(label: str) -> bool:
         return False
     return True
 
+
 def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bool:
     if not new_author:
         return False
     # allow document labels, but reject clearly bad "person" candidates
-    if clean_author_candidate(new_author) is None and new_author not in {default_author, "Document"} and not new_author.lower().endswith(("report","study","paper","review","analysis","audit")):
+    if (
+        clean_author_candidate(new_author) is None
+        and new_author not in {default_author, "Document"}
+        and not new_author.lower().endswith(("report", "study", "paper", "review", "analysis", "audit", "office"))
+    ):
         return False
     if old_author == default_author and new_author != default_author:
         return True
@@ -1223,8 +1312,7 @@ def extract_quotes(
             old["_mode"] = record["_mode"]
         if record.get("_kind") and not old.get("_kind"):
             old["_kind"] = record["_kind"]
-        # chunk metadata: keep if missing
-        for kf in ("_group_id","_chunk_i","_chunk_n"):
+        for kf in ("_group_id", "_chunk_i", "_chunk_n"):
             if record.get(kf) and not old.get(kf):
                 old[kf] = record[kf]
 
@@ -1271,13 +1359,16 @@ def extract_quotes(
                 if carry:
                     a, a_pos = carry
                     if (s - a_pos) <= MAX_CARRY_DISTANCE:
-                        between_norm = fast_context_norm(raw[a_pos:s])
+                        between_norm = fast_context_norm(raw[a_pos:s]).lower()
                         competing = False
                         if REPORTING_SPEAKER_BEFORE_RE.search(between_norm):
                             competing = True
                         if re.search(rf"\b{NAME_PHRASE}\b\s+(?:{ATTR_VERB_RE})\b", between_norm, re.IGNORECASE):
                             competing = True
                         if re.search(rf"\b(?:{DOC_SUBJECT})\s+(?:{DOC_VERB})\b", between_norm, re.IGNORECASE):
+                            competing = True
+                        # NEW: don't carry across spokesperson/office blurbs
+                        if "spokesperson" in between_norm or "'s office" in between_norm:
                             competing = True
                         if not competing:
                             carry_author = a
@@ -1295,13 +1386,17 @@ def extract_quotes(
 
             if enable_paragraph_attribution and author_clean != default_author:
                 if author_src in {
-                    "after_name","before_name","after_org","before_org",
-                    "after_shared_name","generic_role_infer","before_reporting_speaker",
-                    "after_document","before_document",
+                    "after_name", "before_name", "after_org", "before_org",
+                    "after_shared_name", "generic_role_infer", "before_reporting_speaker",
+                    "after_document", "before_document",
+                    # NEW: store for pronoun continuation (helps 2nd quote in a paragraph)
+                    "after_pronoun",
+                    # NEW: office/spokesperson should still anchor within paragraph
+                    "before_office",
                 }:
                     last_author_by_para[para_i] = (author_clean, s)
 
-            kind = "document" if author_src in {"after_document","before_document"} else "speech"
+            kind = "document" if author_src in {"after_document", "before_document"} else "speech"
 
             for ci, cand in enumerate(candidates):
                 cleaned = clamp_minimal(cand, min_len, max_len, max_newlines, max_sentences)
