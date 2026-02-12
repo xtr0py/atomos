@@ -9,7 +9,7 @@ import streamlit as st
 
 from parser_core import (
     extract_quotes,
-    normalize_key,
+    normalize_key,     # now unified with dataset_key in parser_core
     parse_tag_line,
     DEFAULT_MIN_LEN,
     DEFAULT_MAX_LEN,
@@ -199,7 +199,7 @@ def cached_parse(
     out: List[Dict[str, object]] = []
     for r in parsed:
         tags = r.get("tags", []) or []
-        rec = {
+        rec: Dict[str, object] = {
             "approve": True,
             "text": r.get("text", ""),
             "author": r.get("author", ""),
@@ -208,14 +208,18 @@ def cached_parse(
         }
         if include_debug:
             rec["_mode"] = r.get("_mode", "")
+            rec["_kind"] = r.get("_kind", "")
             rec["_author_src"] = r.get("_author_src", "")
+            rec["_group_id"] = r.get("_group_id", "")
+            rec["_chunk_i"] = r.get("_chunk_i", "")
+            rec["_chunk_n"] = r.get("_chunk_n", "")
         out.append(rec)
     return out
 
 def as_editor_df(rows: List[Dict[str, object]], include_debug: bool) -> pd.DataFrame:
     cols = ["approve", "text", "author", "tags_str"]
     if include_debug:
-        cols = ["approve", "_mode", "_author_src", "text", "author", "tags_str"]
+        cols = ["approve", "_mode", "_kind", "_author_src", "_group_id", "_chunk_i", "_chunk_n", "text", "author", "tags_str"]
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
     for col in cols:
@@ -305,7 +309,7 @@ with st.sidebar:
         )
 
         include_debug = st.toggle(
-            "Show debug columns (mode / author source)",
+            "Show debug columns (mode / kind / author source / chunking)",
             value=False,
         )
 
@@ -404,7 +408,11 @@ column_config = {
 }
 if include_debug:
     column_config["_mode"] = st.column_config.TextColumn("Mode", width="small")
+    column_config["_kind"] = st.column_config.TextColumn("Kind", width="small")
     column_config["_author_src"] = st.column_config.TextColumn("Author src", width="small")
+    column_config["_group_id"] = st.column_config.TextColumn("Group", width="small")
+    column_config["_chunk_i"] = st.column_config.TextColumn("Chunk i", width="small")
+    column_config["_chunk_n"] = st.column_config.TextColumn("Chunk n", width="small")
 
 edited = st.data_editor(
     df,
