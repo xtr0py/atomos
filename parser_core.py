@@ -672,18 +672,27 @@ def resolve_author_for_quote(
     lastname_map: Optional[Dict[str, str]],
     last_known_author_in_paragraph: Optional[str],
 ) -> Tuple[str, str]:
-    before = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
+    # Use full windows for general patterns...
+    before_full = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
     after = scrub_attrib_context(fast_context_norm(context_after)[:CTX_WINDOW])
 
-    # 0) Office/spokesperson attribution must override person-name heuristics
-    m_off = OFFICE_SAID_RE.search(before)
+    # ...but for spokesperson/office, only look at the most recent paragraph-ish segment
+    cb = context_before.replace("\r\n", "\n").replace("\r", "\n")
+    cut = cb.rfind("\n\n")
+    local_before_raw = cb[cut + 2 :] if cut != -1 else cb
+    before_local = scrub_attrib_context(fast_context_norm(local_before_raw)[-400:])
+
+    before = before_full
+
+    # 0) Office/spokesperson attribution must override person-name heuristics (LOCAL ONLY)
+    m_off = OFFICE_SAID_RE.search(before_local)
     if m_off:
         who = extract_best_person_name(m_off.group(1)) or normalize_ws(m_off.group(1))
         who = clean_author_candidate(who) or who
         if who:
             return f"{who}'s office", "before_office"
 
-    m_sp = SPOKESPERSON_FOR_OFFICE_RE.search(before)
+    m_sp = SPOKESPERSON_FOR_OFFICE_RE.search(before_local)
     if m_sp:
         who = extract_best_person_name(m_sp.group(1)) or normalize_ws(m_sp.group(1))
         who = clean_author_candidate(who) or who
@@ -691,17 +700,18 @@ def resolve_author_for_quote(
             return f"{who}'s office", "before_office"
 
     # 0.25) Prefer reporting speaker in lead-in clause (news attribution)
-    reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before))
+    # Search a version with quoted segments removed to handle: X said ... “q1” ... “q2”
+    before_nq = strip_quoted_segments(before)
+    reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before_nq))
     if reps:
         # Guard: don't treat "spokesperson for X's office..." as X speaking
-        tail = before[-240:].lower()
+        tail = before_local[-240:].lower()
         if "spokesperson for" in tail or "'s office" in tail:
             reps = []
 
     if reps:
         cand = extract_best_person_name(reps[-1].group(1))
         cand = clean_author_candidate(cand or "")
-        # prevent "Immigration" from "Immigration and Customs ..."
         if cand and " " not in cand and _followed_by_and_cap(before, cand):
             cand = None
         if cand:
@@ -1367,7 +1377,7 @@ def extract_quotes(
                             competing = True
                         if re.search(rf"\b(?:{DOC_SUBJECT})\s+(?:{DOC_VERB})\b", between_norm, re.IGNORECASE):
                             competing = True
-                        # NEW: don't carry across spokesperson/office blurbs
+                        # don't carry across spokesperson/office blurbs
                         if "spokesperson" in between_norm or "'s office" in between_norm:
                             competing = True
                         if not competing:
@@ -1381,7 +1391,6 @@ def extract_quotes(
                 last_known_author_in_paragraph=carry_author,
             )
 
-            # keep document labels even if they aren't "people"
             author_clean = clean_author_candidate(author) or author or default_author
 
             if enable_paragraph_attribution and author_clean != default_author:
@@ -1389,10 +1398,10 @@ def extract_quotes(
                     "after_name", "before_name", "after_org", "before_org",
                     "after_shared_name", "generic_role_infer", "before_reporting_speaker",
                     "after_document", "before_document",
-                    # NEW: store for pronoun continuation (helps 2nd quote in a paragraph)
                     "after_pronoun",
-                    # NEW: office/spokesperson should still anchor within paragraph
                     "before_office",
+                    # NEW: if we used carry successfully, keep anchoring
+                    "carry_or_default",
                 }:
                     last_author_by_para[para_i] = (author_clean, s)
 
