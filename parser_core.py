@@ -259,10 +259,12 @@ GERUND_SINGLE_RE = re.compile(r"^[A-Z][a-z]{2,}ing$")
 BRAINY_SHARE_RE = re.compile(r"\bShare this Quote\b", re.IGNORECASE)
 READ_MORE_AT_RE = re.compile(r"\bRead more at\s+https?://\S+", re.IGNORECASE)
 
-# NEW: “Save” chrome and “Inspirational Quotes On Strategy - ...” chrome
+# NEW: generic "Save" chrome
 SAVE_RE = re.compile(r"^\s*Save\s*$", re.IGNORECASE)
+
+# NEW: inspirationalquotes-like chrome lines that embed the quote again
 INSPO_TITLE_LINE_RE = re.compile(
-    r'^\s*Inspirational\s+Quotes?\s+On\s+Strategy\s*-\s*.*\bSave\b?\s*$',
+    r'^\s*Inspirational\s+Quotes?\s+On\s+Strategy\s*-\s*["“].+["”]\s+.+\s*$',
     re.IGNORECASE,
 )
 
@@ -320,12 +322,8 @@ def looks_like_headline(line: str) -> bool:
 # Attribution (names + verbs + orgs)
 # -----------------------------
 
-# SAFE + FAST:
-# - normal words: Smith, O'Brien
-# - Mc/Mac: McNeill, MacArthur
 NAME_WORD = r"[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+(?:[-'][A-ZÀ-ÖØ-Þa-zà-öø-ÿ]+)?"
 MC_WORD = r"(?:Mc|Mac)[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+"
-
 INITIALS = r"(?:[A-Z]\.){1,3}"
 PARTICLE = r"(?:de|del|da|di|la|le|van|von|der|den|du|st)\.?"
 SUFFIX = r"(?:Jr\.|Sr\.|II|III|IV)"
@@ -516,13 +514,14 @@ def clean_author_candidate(a: str) -> Optional[str]:
     if not n0:
         return None
 
+    if SAVE_RE.match(n0) or INSPO_TITLE_LINE_RE.match(n0):
+        return None
+
     if QUOTEY_LINE_RE.search(n0):
         return None
     if BULLET_RE.match(n0):
         return None
     if GOODREADS_TAGS_RE.match(n0) or LIKES_RE.match(n0) or LIKE_WORD_RE.match(n0):
-        return None
-    if SAVE_RE.match(n0) or INSPO_TITLE_LINE_RE.match(n0):
         return None
 
     n = _DISCOURSE_PREFIX_RE.sub("", n0).strip()
@@ -696,8 +695,6 @@ def resolve_author_for_quote(
     if reps:
         cand = extract_best_person_name(reps[-1].group(1))
         cand = clean_author_candidate(cand or "")
-        if cand:
-            cand = _upgrade_from_carry_if_prefix(cand, last_known_author_in_paragraph)
         if cand and " " not in cand and _followed_by_and_cap(before, cand):
             cand = None
         if cand:
@@ -714,7 +711,6 @@ def resolve_author_for_quote(
     if PRONOUN_AFTER_RE.search(after):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
-            inferred = _upgrade_from_carry_if_prefix(inferred, last_known_author_in_paragraph)
             if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
                 inferred2 = clean_author_candidate(lastname_map[inferred]) or inferred
                 return inferred2, "after_pronoun"
@@ -723,7 +719,6 @@ def resolve_author_for_quote(
     if GENERIC_ROLE_SAID_RE.search(after) or GENERIC_ROLE_SAID_RE.search(before):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
-            inferred = _upgrade_from_carry_if_prefix(inferred, last_known_author_in_paragraph)
             if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
                 inferred2 = clean_author_candidate(lastname_map[inferred]) or inferred
                 return inferred2, "generic_role_infer"
@@ -746,7 +741,6 @@ def resolve_author_for_quote(
     if m_shared:
         name = extract_best_person_name(m_shared.group("n"))
         if name:
-            name = _upgrade_from_carry_if_prefix(name, last_known_author_in_paragraph)
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name2 = clean_author_candidate(lastname_map[name]) or name
                 return name2, "after_shared_name"
@@ -758,7 +752,6 @@ def resolve_author_for_quote(
             continue
         name = extract_best_person_name(m.group(1))
         if name:
-            name = _upgrade_from_carry_if_prefix(name, last_known_author_in_paragraph)
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name2 = clean_author_candidate(lastname_map[name]) or name
                 return name2, "after_name"
@@ -783,7 +776,6 @@ def resolve_author_for_quote(
             continue
         name = extract_best_person_name(m.group(1))
         if name:
-            name = _upgrade_from_carry_if_prefix(name, last_known_author_in_paragraph)
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name2 = clean_author_candidate(lastname_map[name]) or name
                 return name2, "before_name"
@@ -822,8 +814,6 @@ def is_author_line_candidate(line: str) -> bool:
     if letters < 3:
         return False
     if ":" in line:
-        return False
-    if _is_geo_phrase(line) or _is_group_noun(line):
         return False
     return bool(re.search(rf"\b{NAME_TOKEN}\b", line))
 
@@ -954,8 +944,6 @@ def extract_inline_quote_attribution_lines(
         if is_noise_line(line):
             continue
         if GOODREADS_TAGS_RE.match(line.strip()):
-            continue
-        if SAVE_RE.match(line.strip()) or INSPO_TITLE_LINE_RE.match(line.strip()):
             continue
 
         m = INLINE_QUOTE_ATTR_RE.match(line)
@@ -1096,14 +1084,6 @@ def extract_quote_collections(
         j = next_nonempty_index(i + 1)
         if j is not None:
             nxt = lines[j].strip()
-
-            if GOODREADS_TAGS_RE.match(line) or LIKES_RE.match(line) or LIKE_WORD_RE.match(line):
-                i += 1
-                continue
-            if SAVE_RE.match(line) or INSPO_TITLE_LINE_RE.match(line):
-                i += 1
-                continue
-
             if is_author_line_candidate(nxt):
                 a = clean_author_candidate(nxt)
                 if a:
@@ -1250,8 +1230,6 @@ def looks_like_author_field(field: str) -> bool:
         return False
     if _is_non_person_name(f):
         return False
-    if _is_geo_phrase(f) or _is_group_noun(f):
-        return False
     if QUOTEY_LINE_RE.search(f):
         return False
     return f.lower() not in {"english", "french", "spanish", "german"}
@@ -1322,8 +1300,6 @@ def ok_title_speaker(label: str) -> bool:
     if CREDIT_WORD_RE.search(l):
         return False
     if " " not in l and GERUND_SINGLE_RE.match(l):
-        return False
-    if _is_geo_phrase(l) or _is_group_noun(l):
         return False
     return True
 
