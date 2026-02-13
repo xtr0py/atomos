@@ -1,5 +1,4 @@
 # parser_core.py
-# Lean quote + attribution extraction engine (improved for news + transcripts + web material)
 
 import re
 from bisect import bisect_right
@@ -31,7 +30,7 @@ _WS_NEWLINE_TRIM_RE = re.compile(r"[ \t]*\n[ \t]*")  # preserve blank lines
 _WS_MULTI_RE = re.compile(r"\s+")
 _PUNCT_SPACE_RE = re.compile(r"\s+([,.;:!?])")
 
-# NOTE: keep apostrophes so we're / don't remain distinct
+# Keep apostrophes so "don't" etc remain distinct
 _DEDUPE_RE = re.compile(r"[\s\"“”‘’`]+")
 
 
@@ -255,6 +254,10 @@ CREDIT_WORD_RE = re.compile(
 
 GERUND_SINGLE_RE = re.compile(r"^[A-Z][a-z]{2,}ing$")
 
+# BrainyQuote chrome
+BRAINY_SHARE_RE = re.compile(r"\bShare this Quote\b", re.IGNORECASE)
+READ_MORE_AT_RE = re.compile(r"\bRead more at\s+https?://\S+", re.IGNORECASE)
+
 
 def scrub_attrib_context(s: str) -> str:
     s = PHOTO_CREDIT_SEG_RE.sub("", s)
@@ -407,10 +410,10 @@ NON_NAME_SINGLETONS = {
     # common capitalized non-names
     "times","post","reuters","ap","bbc","cnn","court","police","judge","officials","source","sources",
     "images","getty",
-    # languages / common topics that show up capitalized
+    # languages / common topics
     "spanish","english","french","german","italian","portuguese","arabic","chinese","russian","japanese","korean",
     "immigration","customs","enforcement","ice",
-    # frequent event/brand tokens
+    # event/brand tokens
     "grammy","grammys","awards","super","bowl","halftime","show","apple","music",
     # sentence-starter verbs/gerunds
     "calling","saying","asking","warning","noting","adding","explaining",
@@ -442,7 +445,7 @@ EVENT_PHRASES = {
     "all american halftime show",
 }
 
-# US states + DC (prevents South Dakota / Massachusetts speaker bugs)
+# US states + DC
 _US_STATES = {
     "alabama","alaska","arizona","arkansas","california","colorado","connecticut","delaware","florida","georgia",
     "hawaii","idaho","illinois","indiana","iowa","kansas","kentucky","louisiana","maine","maryland","massachusetts",
@@ -511,7 +514,8 @@ def clean_author_candidate(a: str) -> Optional[str]:
     """
     Final safety filter before accepting an attribution candidate.
     Rejects languages, events, topics, photo credits, pseudo-titles, org fragments,
-    and date lead-ins; strips discourse prefixes ("But Trump").
+    date lead-ins, quote-containing strings, and bullet/numbered strings.
+    Also strips discourse prefixes ("But Trump").
     """
     if not a:
         return None
@@ -519,6 +523,14 @@ def clean_author_candidate(a: str) -> Optional[str]:
     n0 = tidy_quote_text(a)
     n0 = PHOTO_CREDIT_TAIL_RE.sub("", n0).strip()
     if not n0:
+        return None
+
+    # Never accept an "author" that contains quote marks or looks like a numbered/bullet line
+    if QUOTEY_LINE_RE.search(n0):
+        return None
+    if BULLET_RE.match(n0):
+        return None
+    if GOODREADS_TAGS_RE.match(n0) or LIKES_RE.match(n0) or LIKE_WORD_RE.match(n0):
         return None
 
     n = _DISCOURSE_PREFIX_RE.sub("", n0).strip()
@@ -828,12 +840,19 @@ def is_author_line_candidate(line: str) -> bool:
         return False
     if NUMBER_HEADER_RE.match(line):
         return False
-    if GOODREADS_TAGS_RE.match(line):
+    if GOODREADS_TAGS_RE.match(line) or LIKES_RE.match(line) or LIKE_WORD_RE.match(line):
+        return False
+    # CRITICAL: never treat a quote-like line as an author line
+    if QUOTEY_LINE_RE.search(line):
+        return False
+    if BULLET_RE.match(line):
         return False
     letters = sum(1 for c in line if c.isalpha())
     if letters < 3:
         return False
     if ":" in line:
+        return False
+    if _is_geo_phrase(line) or _is_group_noun(line):
         return False
     return bool(re.search(rf"\b{NAME_TOKEN}\b", line))
 
@@ -847,12 +866,14 @@ def has_quote_collection_cues(text: str) -> bool:
     attributions = sum(1 for l in nonempty if ATTRIBUTION_LINE_RE.match(l.strip()))
     tags = sum(1 for l in nonempty if GOODREADS_TAGS_RE.match(l.strip()))
     quoted = sum(1 for l in nonempty if QUOTEY_LINE_RE.search(l))
-
     authorish = sum(1 for l in nonempty if is_author_line_candidate(l))
+    share = len(BRAINY_SHARE_RE.findall(text))
 
     if tags > 0 or attributions > 0:
         return True
     if bulletish >= 2:
+        return True
+    if share >= 2:
         return True
     if len(nonempty) <= 30 and quoted >= 3 and (quoted / len(nonempty)) >= 0.5:
         return True
@@ -872,6 +893,140 @@ def parse_tag_line(tag_line: str) -> List[str]:
             continue
         seen.add(k)
         out.append(t)
+    return out
+
+
+# Inline quote + author on same line:
+INLINE_QUOTE_ATTR_RE = re.compile(
+    r'^\s*[“"](?P<q>.+?)[”"]\s*(?:[—–―-]\s*(?P<a>[^,\n]{2,120})|[(\[]\s*(?P<a2>[^)\]\n]{2,120})\s*[)\]])\s*$'
+)
+
+# Bullet line with quoted span + trailing author:
+#   6. “Hope ...” Vince Lombardi
+BULLET_QUOTE_AUTHOR_RE = re.compile(
+    rf'^\s*(?:[-*•‣▪]|(\d+)[.)])\s*[“"](?P<q>.+?)[”"]\s*(?P<a>{NAME_PHRASE})\s*$'
+)
+
+# Bullet line without quotes, trailing author (very gated by cues):
+BULLET_PLAIN_AUTHOR_RE = re.compile(
+    rf'^\s*(?:[-*•‣▪]|(\d+)[.)])\s*(?P<q>.+?)\s+(?P<a>{NAME_PHRASE})\s*$'
+)
+
+
+def extract_brainyquote_stream(
+    text: str,
+    *,
+    default_author: str,
+    min_len: int,
+    max_len: int,
+    max_newlines: int,
+    max_sentences: int,
+    include_debug: bool,
+) -> List[Dict[str, object]]:
+    """
+    Handles BrainyQuote / similar pages that paste as:
+      <quote> Share this Quote <Author> <quote> Share this Quote <Author> ...
+    Often on one line, sometimes across a few wrapped lines.
+    """
+    if len(BRAINY_SHARE_RE.findall(text)) < 2:
+        return []
+
+    # Remove footer "Read more at ..." and URLs around it
+    cleaned = READ_MORE_AT_RE.sub("", text)
+    cleaned = cleaned.replace("\n", " ")
+    cleaned = _WS_SPACES_RE.sub(" ", cleaned).strip()
+
+    # Split on the chrome phrase
+    parts = re.split(r"\bShare this Quote\b", cleaned, flags=re.IGNORECASE)
+    if len(parts) < 3:
+        return []
+
+    out: List[Dict[str, object]] = []
+    pos = 0
+
+    # Each segment after a split typically ends with an author name; the quote text is before that author.
+    # We'll scan each segment and extract trailing NAME_PHRASE.
+    for seg in parts:
+        seg = seg.strip()
+        if not seg:
+            pos += 1
+            continue
+
+        # Remove obvious footer bits
+        seg = re.sub(r"\s*Read more\b.*$", "", seg, flags=re.IGNORECASE).strip()
+
+        # Find trailing name phrase
+        m = re.search(rf"(?P<q>.+?)\s+(?P<a>{NAME_PHRASE})\s*$", seg)
+        if not m:
+            pos += len(seg) + 1
+            continue
+
+        q_raw = m.group("q").strip()
+        a_raw = m.group("a").strip()
+
+        author = clean_author_candidate(a_raw) or default_author
+
+        candidates = chunk_quote_to_maxlen(q_raw, max_len=max_len) if len(tidy_quote_text(q_raw)) > max_len else [q_raw]
+        for c in candidates:
+            qt = clamp_minimal(c, min_len, max_len, max_newlines, max_sentences)
+            if not qt:
+                continue
+            rec = {"text": qt, "author": author, "tags": [], "_pos": pos}
+            if include_debug:
+                rec["_mode"] = "brainyquote"
+            out.append(rec)
+
+        pos += len(seg) + 1
+
+    return out
+
+
+def extract_inline_quote_attribution_lines(
+    raw: str,
+    *,
+    default_author: str,
+    min_len: int,
+    max_len: int,
+    max_newlines: int,
+    max_sentences: int,
+    line_starts: List[int],
+    include_debug: bool,
+    enable_speech_filter: bool,
+) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    for i, line in enumerate(raw.splitlines()):
+        if is_noise_line(line):
+            continue
+        if GOODREADS_TAGS_RE.match(line.strip()):
+            continue
+
+        m = INLINE_QUOTE_ATTR_RE.match(line)
+        if not m:
+            continue
+
+        q_raw = m.group("q")
+        candidates = chunk_quote_to_maxlen(q_raw, max_len=max_len) if len(tidy_quote_text(q_raw)) > max_len else [q_raw]
+
+        author_raw = (m.group("a") or m.group("a2") or default_author).strip()
+
+        # Optional: if author includes ", Book", keep only person part when it still looks like a name
+        if "," in author_raw:
+            head = author_raw.split(",", 1)[0].strip()
+            if re.search(rf"^{NAME_PHRASE}$", head):
+                author_raw = head
+
+        author = clean_author_candidate(author_raw) or default_author
+
+        for c in candidates:
+            qt = clamp_minimal(c, min_len, max_len, max_newlines, max_sentences)
+            if not qt:
+                continue
+            if enable_speech_filter and not speech_like_quote(qt):
+                continue
+            rec = {"text": qt, "author": author, "tags": [], "_pos": line_starts[i]}
+            if include_debug:
+                rec["_mode"] = "inline"
+            out.append(rec)
     return out
 
 
@@ -955,6 +1110,29 @@ def extract_quote_collections(
             continue
 
         raw_src = raw_lines[i]
+
+        # 1) Bullet line: “Quote” Author
+        m_bqa = BULLET_QUOTE_AUTHOR_RE.match(raw_src.strip())
+        if m_bqa:
+            q = m_bqa.group("q")
+            a = m_bqa.group("a")
+            add_entry(q, a, pos=line_starts[i])
+            current_author = clean_author_candidate(a) or current_author
+            i += 1
+            continue
+
+        # 2) Bullet line without quote marks: Quote Author (only if it looks like a quote-page)
+        m_bpa = BULLET_PLAIN_AUTHOR_RE.match(raw_src.strip())
+        if m_bpa:
+            q = m_bpa.group("q")
+            a = m_bpa.group("a")
+            # avoid accidentally parsing prose as "quote author"
+            if speech_like_quote(q) or any(p in q for p in (".", "?", "!")):
+                add_entry(q, a, pos=line_starts[i])
+                current_author = clean_author_candidate(a) or current_author
+                i += 1
+                continue
+
         is_bullet = bool(BULLET_RE.match(raw_src))
         starts_with_quote = raw_src.lstrip().startswith(("“", '"', "«", "‘", "'"))
 
@@ -969,6 +1147,12 @@ def extract_quote_collections(
         j = next_nonempty_index(i + 1)
         if j is not None:
             nxt = lines[j].strip()
+
+            # Never treat Goodreads metadata as quote text in this pathway
+            if GOODREADS_TAGS_RE.match(line) or LIKES_RE.match(line) or LIKE_WORD_RE.match(line):
+                i += 1
+                continue
+
             if is_author_line_candidate(nxt):
                 a = clean_author_candidate(nxt)
                 if a:
@@ -1117,7 +1301,10 @@ def looks_like_author_field(field: str) -> bool:
         return False
     if _is_geo_phrase(f) or _is_group_noun(f):
         return False
+    if QUOTEY_LINE_RE.search(f):
+        return False
     return f.lower() not in {"english", "french", "spanish", "german"}
+
 
 def extract_table_rows(
     text: str,
@@ -1168,54 +1355,6 @@ def extract_table_rows(
 
 
 # -----------------------------
-# Inline quoted line + attribution on same line
-# -----------------------------
-
-INLINE_QUOTE_ATTR_RE = re.compile(
-    r'^\s*[“"](?P<q>.+?)[”"]\s*(?:[—–-]\s*(?P<a>[^,\n]{2,120})|[(\[]\s*(?P<a2>[^)\]\n]{2,120})\s*[)\]])\s*$'
-)
-
-def extract_inline_quote_attribution_lines(
-    raw: str,
-    *,
-    default_author: str,
-    min_len: int,
-    max_len: int,
-    max_newlines: int,
-    max_sentences: int,
-    line_starts: List[int],
-    include_debug: bool,
-    enable_speech_filter: bool,
-) -> List[Dict[str, object]]:
-    out: List[Dict[str, object]] = []
-    for i, line in enumerate(raw.splitlines()):
-        if is_noise_line(line):
-            continue
-        if GOODREADS_TAGS_RE.match(line.strip()):
-            continue
-        m = INLINE_QUOTE_ATTR_RE.match(line)
-        if not m:
-            continue
-
-        q_raw = m.group("q")
-        candidates = chunk_quote_to_maxlen(q_raw, max_len=max_len) if len(tidy_quote_text(q_raw)) > max_len else [q_raw]
-        author_raw = m.group("a") or m.group("a2") or default_author
-        author = clean_author_candidate(author_raw) or default_author
-
-        for c in candidates:
-            qt = clamp_minimal(c, min_len, max_len, max_newlines, max_sentences)
-            if not qt:
-                continue
-            if enable_speech_filter and not speech_like_quote(qt):
-                continue
-            rec = {"text": qt, "author": author, "tags": [], "_pos": line_starts[i]}
-            if include_debug:
-                rec["_mode"] = "inline"
-            out.append(rec)
-    return out
-
-
-# -----------------------------
 # Main extraction
 # -----------------------------
 
@@ -1236,6 +1375,7 @@ def ok_title_speaker(label: str) -> bool:
     if _is_geo_phrase(l) or _is_group_noun(l):
         return False
     return True
+
 
 def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bool:
     if not new_author:
@@ -1292,7 +1432,7 @@ def extract_quotes(
     def paragraph_index_for_pos(pos: int) -> int:
         return max(0, bisect_right(para_starts, pos) - 1)
 
-    # Store (author, last_attrib_pos) — store at quote END for carry to next quote
+    # Store (author, last_attrib_pos) — stored at quote END for carry to next quote
     last_author_by_para: Dict[int, Tuple[str, int]] = {}
 
     lastname_map: Optional[Dict[str, str]] = None
@@ -1335,6 +1475,19 @@ def extract_quotes(
             old["_author_src"] = record["_author_src"]
         if record.get("_mode") and not old.get("_mode"):
             old["_mode"] = record["_mode"]
+
+    # 0) BrainyQuote stream (only when collections enabled and cues are present)
+    if enable_quote_collections and has_quote_collection_cues(raw):
+        for r in extract_brainyquote_stream(
+            raw,
+            default_author=default_author,
+            min_len=min_len,
+            max_len=max_len,
+            max_newlines=max_newlines,
+            max_sentences=max_sentences,
+            include_debug=include_debug,
+        ):
+            add_or_upgrade(r)
 
     # 1) Inline quote + attribution on the same line
     if enable_inline_attribution:
@@ -1389,7 +1542,7 @@ def extract_quotes(
             if carry_author:
                 author = _upgrade_from_carry_if_prefix(author, carry_author)
 
-            # Update carry at quote END (helps multi-quote paragraphs)
+            # Update carry at quote END
             if enable_paragraph_attribution and author != default_author:
                 last_author_by_para[para_i] = (author, e)
 
