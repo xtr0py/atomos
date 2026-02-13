@@ -2,7 +2,7 @@
 
 A lightweight, regex‑based quote extraction tool with a Streamlit review UI and JSONL append‑only storage.
 
----
+
 
 ## Key Features
 
@@ -13,7 +13,7 @@ A lightweight, regex‑based quote extraction tool with a Streamlit review UI an
 - **Prevents duplicates automatically** by detecting quotes that already exist in your dataset  
 - **Saves clean, structured data** as append-only JSONL (`text`, `author`, `tags`) ready for analysis or training 
 
----
+
 
 ## Project Layout
 
@@ -29,7 +29,7 @@ atomos/
 * `parser_core.py` contains all parsing logic and can be tested independently.
 * `app.py` is only UI + caching + file I/O (kept thin on purpose).
 
----
+
 
 ## Running with Docker
 
@@ -57,7 +57,7 @@ All quotes will be saved to:
 ./data/quotes.jsonl
 ```
 
----
+
 
 ## Environment variables
 
@@ -73,7 +73,7 @@ export JSONL_PATH=/tmp/my_quotes.jsonl
 streamlit run app.py
 ```
 
----
+
 
 ## Output format (JSONL)
 
