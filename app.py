@@ -416,7 +416,7 @@ if include_debug:
 
 edited = st.data_editor(
     df,
-    use_container_width=True,
+    width='stretch',
     num_rows="fixed",
     column_config=column_config,
 )
