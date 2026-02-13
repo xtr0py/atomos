@@ -1,4 +1,5 @@
 # parser_core.py
+# Lean quote + attribution extraction engine (improved for news + transcripts + web material)
 
 import re
 import hashlib
@@ -398,7 +399,7 @@ REPORTING_SPEAKER_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# NEW: spokesperson / office attribution (prevents "Polis" being treated as speaker)
+# spokesperson / office attribution
 SPOKESPERSON_FOR_OFFICE_RE = re.compile(
     rf"\b(?:a\s+)?spokesperson\s+for\s+({NAME_PHRASE})\s*'?\s*office\b.*?\b(?:{ATTR_VERB_RE})\b",
     re.IGNORECASE,
@@ -479,20 +480,14 @@ def normalize_doc_subject(subject: str, context_before: str, context_after: str)
 # -----------------------------
 
 NON_NAME_SINGLETONS = {
-    # days/months
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
     "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
-    # determiners (prevent "The")
     "the", "a", "an",
-    # common capitalized non-names
     "times", "post", "reuters", "ap", "bbc", "cnn", "court", "police", "judge", "officials", "source", "sources",
     "images", "getty",
-    # languages / common topics
     "spanish", "english", "french", "german", "italian", "portuguese", "arabic", "chinese", "russian", "japanese", "korean",
     "immigration", "customs", "enforcement", "ice",
-    # frequent event/brand tokens
     "grammy", "grammys", "awards", "super", "bowl", "halftime", "show", "apple", "music",
-    # sentence-starter verbs/gerunds
     "calling", "saying", "asking", "warning", "noting", "adding", "explaining",
 }
 
@@ -545,7 +540,6 @@ def clean_author_candidate(a: str) -> Optional[str]:
 
     low = n.lower().strip(".,;:!?")
 
-    # Never accept bare determiners as "names"
     if " " not in n and low in {"the", "a", "an"}:
         return None
 
@@ -617,16 +611,29 @@ def _followed_by_and_cap(text: str, token: str) -> bool:
     return bool(re.search(rf"\b{re.escape(token)}\s+and\s+[A-Z]", text))
 
 
+# NEW: skip names that look like objects of a preposition (e.g., "lashed out at Stitt")
+_OBJ_PREP_RE = re.compile(r"(?:\b(at|to|for|of|from|with|against)\s+)$", re.IGNORECASE)
+
+
+def _is_object_of_prep(before_norm: str, start_idx: int) -> bool:
+    window = before_norm[max(0, start_idx - 24): start_idx]
+    return bool(_OBJ_PREP_RE.search(window))
+
+
 def infer_nearest_name_in_before(before: str) -> Optional[str]:
     """
     Search backward and SKIP rejected candidates.
-    Also avoids singleton tokens that are part of "X and Y ..." phrases.
-    Also strips quoted segments to avoid picking names from earlier quotes.
+    Avoid singleton tokens in "X and Y ...".
+    Strip quoted segments to avoid pulling names from earlier quotes.
+    NEW: skip tokens that are objects of prepositions (at/to/for/of/from/with/against).
     """
     b = normalize_ws(strip_quoted_segments(before))
+    b_low = b.lower()
 
     matches = list(FULLNAME_RE.finditer(b))
     for mm in reversed(matches):
+        if _is_object_of_prep(b_low, mm.start()):
+            continue
         parts = [p for p in mm.groups() if p]
         parts = [p for p in parts if p and p.lower().strip(".") not in {"de", "del", "da", "di", "la", "le", "van", "von", "der", "den", "du", "st"}]
         cand = " ".join(parts).strip()
@@ -636,6 +643,8 @@ def infer_nearest_name_in_before(before: str) -> Optional[str]:
 
     tokens = list(re.finditer(rf"\b({NAME_TOKEN})\b", b))
     for mm in reversed(tokens):
+        if _is_object_of_prep(b_low, mm.start()):
+            continue
         cand = mm.group(1)
         if cand.lower().strip(".") in NON_NAME_SINGLETONS:
             continue
@@ -679,7 +688,7 @@ def resolve_author_for_quote(
     # ...but for spokesperson/office, only look at the most recent paragraph-ish segment
     cb = context_before.replace("\r\n", "\n").replace("\r", "\n")
     cut = cb.rfind("\n\n")
-    local_before_raw = cb[cut + 2 :] if cut != -1 else cb
+    local_before_raw = cb[cut + 2:] if cut != -1 else cb
     before_local = scrub_attrib_context(fast_context_norm(local_before_raw)[-400:])
 
     before = before_full
@@ -704,7 +713,6 @@ def resolve_author_for_quote(
     before_nq = strip_quoted_segments(before)
     reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before_nq))
     if reps:
-        # Guard: don't treat "spokesperson for X's office..." as X speaking
         tail = before_local[-240:].lower()
         if "spokesperson for" in tail or "'s office" in tail:
             reps = []
@@ -814,254 +822,6 @@ def resolve_author_for_quote(
     if carry:
         return carry, "carry_or_default"
     return default_author, "carry_or_default"
-
-
-# -----------------------------
-# Quote collections (curated lists)
-# -----------------------------
-
-def is_author_line_candidate(line: str) -> bool:
-    line = line.strip()
-    if not line or len(line) > 70:
-        return False
-    if is_noise_line(line):
-        return False
-    if looks_like_headline(line):
-        return False
-    if NUMBER_HEADER_RE.match(line):
-        return False
-    if GOODREADS_TAGS_RE.match(line):
-        return False
-    letters = sum(1 for c in line if c.isalpha())
-    if letters < 3:
-        return False
-    if ":" in line:
-        return False
-    return bool(re.search(rf"\b{NAME_TOKEN}\b", line))
-
-
-def has_quote_collection_cues(text: str) -> bool:
-    nonempty = [l.rstrip() for l in text.splitlines() if l.strip()]
-    if len(nonempty) < 2:
-        return False
-
-    bulletish = sum(1 for l in nonempty if BULLET_RE.match(l))
-    attributions = sum(1 for l in nonempty if ATTRIBUTION_LINE_RE.match(l.strip()))
-    tags = sum(1 for l in nonempty if GOODREADS_TAGS_RE.match(l.strip()))
-    quoted = sum(1 for l in nonempty if QUOTEY_LINE_RE.search(l))
-
-    authorish = sum(1 for l in nonempty if is_author_line_candidate(l))
-
-    if tags > 0 or attributions > 0:
-        return True
-    if bulletish >= 2:
-        return True
-    if len(nonempty) <= 30 and quoted >= 3 and (quoted / len(nonempty)) >= 0.5:
-        return True
-    if authorish >= 2 and len(nonempty) <= 60:
-        return True
-    return False
-
-
-def parse_tag_line(tag_line: str) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for t in (p.strip() for p in tag_line.split(",")):
-        if not t:
-            continue
-        k = t.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(t)
-    return out
-
-
-def extract_quote_collections(
-    text: str,
-    *,
-    default_author: str,
-    min_len: int,
-    max_len: int,
-    max_newlines: int,
-    max_sentences: int,
-    line_starts: List[int],
-    include_debug: bool,
-) -> List[Dict[str, object]]:
-    raw_lines = text.splitlines()
-    lines = [normalize_ws(l) for l in raw_lines]
-
-    results: List[Dict[str, object]] = []
-    current_author: Optional[str] = None
-    last_entry_index: Optional[int] = None
-
-    def add_entry(qtext: str, author: Optional[str], pos: int) -> None:
-        nonlocal last_entry_index
-        cleaned = clamp_minimal(qtext, min_len, max_len, max_newlines, max_sentences)
-        if not cleaned:
-            return
-        author_clean = clean_author_candidate(author or "") or default_author
-        rec: Dict[str, object] = {"text": cleaned, "author": author_clean, "tags": [], "_pos": pos}
-        if include_debug:
-            rec["_mode"] = "collections"
-            rec["_kind"] = "collection"
-        results.append(rec)
-        last_entry_index = len(results) - 1
-
-    for idx, raw_line in enumerate(lines):
-        line = raw_line.strip()
-        if not line or is_noise_line(line):
-            continue
-
-        m_tags = GOODREADS_TAGS_RE.match(line)
-        if m_tags and last_entry_index is not None:
-            results[last_entry_index]["tags"] = parse_tag_line(m_tags.group(1))
-            continue
-
-        m_attr = ATTRIBUTION_LINE_RE.match(line)
-        if m_attr and last_entry_index is not None:
-            a = clean_author_candidate(m_attr.group(1))
-            if a:
-                results[last_entry_index]["author"] = a
-                current_author = a
-            continue
-
-        if NUMBER_HEADER_RE.match(line):
-            continue
-
-        if is_author_line_candidate(line):
-            a = clean_author_candidate(line)
-            if a:
-                current_author = a
-            continue
-
-        raw_src = raw_lines[idx]
-        is_bullet = bool(BULLET_RE.match(raw_src))
-        starts_with_quote = raw_src.lstrip().startswith(("“", '"', "«", "‘", "'"))
-        if not is_bullet and not starts_with_quote:
-            continue
-
-        line_for_quote = BULLET_RE.sub("", raw_src).strip() if is_bullet else line
-        add_entry(line_for_quote, current_author, pos=line_starts[idx])
-
-    return results
-
-
-# -----------------------------
-# Quoted-span scanning
-# -----------------------------
-
-_PARA_SPLIT_RE = re.compile(r"\n\s*\n")
-
-
-def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
-    spans: List[Tuple[int, int]] = []
-    for p_start, p_end in _paragraph_ranges(text):
-        spans.extend(_scan_quote_spans_in_block(text, p_start, p_end))
-    spans.sort(key=lambda x: (x[0], x[1]))
-    return _outermost_intervals(spans)
-
-
-def _paragraph_ranges(text: str) -> List[Tuple[int, int]]:
-    ranges: List[Tuple[int, int]] = []
-    start = 0
-    for m in _PARA_SPLIT_RE.finditer(text):
-        end = m.start()
-        if start < end:
-            ranges.append((start, end))
-        start = m.end()
-    if start < len(text):
-        ranges.append((start, len(text)))
-    return ranges
-
-
-def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[int, int]]:
-    out: List[Tuple[int, int]] = []
-    curly_stack: List[int] = []
-    straight_stack: List[int] = []
-    angle_stack: List[int] = []
-
-    def is_escaped(i: int) -> bool:
-        return i > 0 and text[i - 1] == "\\"
-
-    def looks_like_inch_mark(i: int) -> bool:
-        return i > 0 and text[i - 1].isdigit()
-
-    def is_word_char(ch: str) -> bool:
-        return ch.isalpha() or ch.isdigit() or ch == "_"
-
-    def looks_like_apostrophe_quote(i: int) -> bool:
-        if i <= 0 or i + 1 >= len(text):
-            return False
-        return is_word_char(text[i - 1]) and is_word_char(text[i + 1])
-
-    def looks_like_dangling_closer(i: int) -> bool:
-        if i <= 0:
-            return False
-        if not is_word_char(text[i - 1]):
-            return False
-        j = i + 1
-        while j < len(text) and text[j].isspace():
-            j += 1
-        if j >= len(text):
-            return False
-        return text[j] in ",.;:)]}"
-
-    for i in range(start, end):
-        ch = text[i]
-
-        if ch == "“":
-            curly_stack.append(i)
-            continue
-        if ch == "”":
-            if curly_stack:
-                out.append((curly_stack.pop(), i))
-            continue
-
-        if ch == "«":
-            angle_stack.append(i)
-            continue
-        if ch == "»":
-            if angle_stack:
-                out.append((angle_stack.pop(), i))
-            continue
-
-        if ch != '"':
-            continue
-
-        if is_escaped(i) or looks_like_inch_mark(i) or looks_like_apostrophe_quote(i):
-            continue
-
-        if straight_stack:
-            out.append((straight_stack.pop(), i))
-            continue
-
-        if looks_like_dangling_closer(i):
-            continue
-
-        straight_stack.append(i)
-
-    return out
-
-
-def _outermost_intervals(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    if not spans:
-        return []
-    spans = sorted(spans, key=lambda x: (x[0], -x[1]))
-    outer: List[Tuple[int, int]] = []
-    cur_start = -1
-    cur_end = -1
-    for s, e in spans:
-        if not outer:
-            outer.append((s, e))
-            cur_start, cur_end = s, e
-            continue
-        if s >= cur_start and e <= cur_end:
-            continue
-        outer.append((s, e))
-        cur_start, cur_end = s, e
-    outer.sort(key=lambda x: x[0])
-    return outer
 
 
 # -----------------------------
@@ -1190,6 +950,123 @@ def extract_inline_quote_attribution_lines(
 
 
 # -----------------------------
+# Quoted-span scanning
+# -----------------------------
+
+_PARA_SPLIT_RE = re.compile(r"\n\s*\n")
+
+
+def scan_quote_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    for p_start, p_end in _paragraph_ranges(text):
+        spans.extend(_scan_quote_spans_in_block(text, p_start, p_end))
+    spans.sort(key=lambda x: (x[0], x[1]))
+    return _outermost_intervals(spans)
+
+
+def _paragraph_ranges(text: str) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    for m in _PARA_SPLIT_RE.finditer(text):
+        end = m.start()
+        if start < end:
+            ranges.append((start, end))
+        start = m.end()
+    if start < len(text):
+        ranges.append((start, len(text)))
+    return ranges
+
+
+def _scan_quote_spans_in_block(text: str, start: int, end: int) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    curly_stack: List[int] = []
+    straight_stack: List[int] = []
+    angle_stack: List[int] = []
+
+    def is_escaped(i: int) -> bool:
+        return i > 0 and text[i - 1] == "\\"
+
+    def looks_like_inch_mark(i: int) -> bool:
+        return i > 0 and text[i - 1].isdigit()
+
+    def is_word_char(ch: str) -> bool:
+        return ch.isalpha() or ch.isdigit() or ch == "_"
+
+    def looks_like_apostrophe_quote(i: int) -> bool:
+        if i <= 0 or i + 1 >= len(text):
+            return False
+        return is_word_char(text[i - 1]) and is_word_char(text[i + 1])
+
+    def looks_like_dangling_closer(i: int) -> bool:
+        if i <= 0:
+            return False
+        if not is_word_char(text[i - 1]):
+            return False
+        j = i + 1
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text):
+            return False
+        return text[j] in ",.;:)]}"
+
+    for i in range(start, end):
+        ch = text[i]
+
+        if ch == "“":
+            curly_stack.append(i)
+            continue
+        if ch == "”":
+            if curly_stack:
+                out.append((curly_stack.pop(), i))
+            continue
+
+        if ch == "«":
+            angle_stack.append(i)
+            continue
+        if ch == "»":
+            if angle_stack:
+                out.append((angle_stack.pop(), i))
+            continue
+
+        if ch != '"':
+            continue
+
+        if is_escaped(i) or looks_like_inch_mark(i) or looks_like_apostrophe_quote(i):
+            continue
+
+        if straight_stack:
+            out.append((straight_stack.pop(), i))
+            continue
+
+        if looks_like_dangling_closer(i):
+            continue
+
+        straight_stack.append(i)
+
+    return out
+
+
+def _outermost_intervals(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    if not spans:
+        return []
+    spans = sorted(spans, key=lambda x: (x[0], -x[1]))
+    outer: List[Tuple[int, int]] = []
+    cur_start = -1
+    cur_end = -1
+    for s, e in spans:
+        if not outer:
+            outer.append((s, e))
+            cur_start, cur_end = s, e
+            continue
+        if s >= cur_start and e <= cur_end:
+            continue
+        outer.append((s, e))
+        cur_start, cur_end = s, e
+    outer.sort(key=lambda x: x[0])
+    return outer
+
+
+# -----------------------------
 # Main extraction
 # -----------------------------
 
@@ -1217,7 +1094,6 @@ def ok_title_speaker(label: str) -> bool:
 def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bool:
     if not new_author:
         return False
-    # allow document labels, but reject clearly bad "person" candidates
     if (
         clean_author_candidate(new_author) is None
         and new_author not in {default_author, "Document"}
@@ -1315,7 +1191,6 @@ def extract_quotes(
                     existing_lower.add(str(t).lower())
             old["tags"] = old_tags
 
-        # debug merge
         if record.get("_author_src") and not old.get("_author_src"):
             old["_author_src"] = record["_author_src"]
         if record.get("_mode") and not old.get("_mode"):
@@ -1341,17 +1216,17 @@ def extract_quotes(
         ):
             add_or_upgrade(r)
 
-    # 2) Quoted spans (contextual attribution)
+    # 2) Quoted spans
     spans = scan_quote_spans(raw) if enable_quoted_spans else []
     if spans:
         lm = get_lastname_map() if len(spans) >= 2 else None
         for (s, e) in spans:
-            inside = raw[s + 1 : e]
+            inside = raw[s + 1: e]
             if not inside.strip():
                 continue
 
-            before = raw[max(0, s - CTX_WINDOW) : s]
-            after = raw[e + 1 : min(len(raw), e + 1 + CTX_WINDOW)]
+            before = raw[max(0, s - CTX_WINDOW): s]
+            after = raw[e + 1: min(len(raw), e + 1 + CTX_WINDOW)]
 
             if _looks_like_quoted_title(before, inside):
                 continue
@@ -1377,7 +1252,6 @@ def extract_quotes(
                             competing = True
                         if re.search(rf"\b(?:{DOC_SUBJECT})\s+(?:{DOC_VERB})\b", between_norm, re.IGNORECASE):
                             competing = True
-                        # don't carry across spokesperson/office blurbs
                         if "spokesperson" in between_norm or "'s office" in between_norm:
                             competing = True
                         if not competing:
@@ -1400,7 +1274,6 @@ def extract_quotes(
                     "after_document", "before_document",
                     "after_pronoun",
                     "before_office",
-                    # NEW: if we used carry successfully, keep anchoring
                     "carry_or_default",
                 }:
                     last_author_by_para[para_i] = (author_clean, s)
@@ -1459,21 +1332,7 @@ def extract_quotes(
                 rec["_kind"] = "dialogue"
             add_or_upgrade(rec)
 
-    # 4) Quote collections — gated
-    if enable_quote_collections and has_quote_collection_cues(raw):
-        for r in extract_quote_collections(
-            raw,
-            default_author=default_author,
-            min_len=min_len,
-            max_len=max_len,
-            max_newlines=max_newlines,
-            max_sentences=max_sentences,
-            line_starts=line_starts,
-            include_debug=include_debug,
-        ):
-            add_or_upgrade(r)
-
-    # 5) Tables / TSV rows
+    # 5) Tables / TSV rows (optional)
     if enable_tables:
         for r in extract_table_rows(
             raw,
@@ -1532,3 +1391,21 @@ def extract_quotes(
         return out_dbg
 
     return [{"text": r["text"], "author": r["author"], "tags": r.get("tags", [])} for r in results]
+
+
+# -----------------------------
+# Tag parsing (used by app.py)
+# -----------------------------
+
+def parse_tag_line(tag_line: str) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for t in (p.strip() for p in tag_line.split(",")):
+        if not t:
+            continue
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
