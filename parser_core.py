@@ -1,5 +1,4 @@
 # parser_core.py
-# Lean quote + attribution extraction engine (improved for news + transcripts + web material)
 
 import re
 import hashlib
@@ -32,7 +31,7 @@ _WS_NEWLINE_TRIM_RE = re.compile(r"[ \t]*\n[ \t]*")  # preserve blank lines
 _WS_MULTI_RE = re.compile(r"\s+")
 _PUNCT_SPACE_RE = re.compile(r"\s+([,.;:!?])")
 
-# NOTE: we preserve apostrophes to avoid collapsing "we're" vs "were"
+# NOTE: preserve apostrophes to avoid collapsing "we're" vs "were"
 _DEDUPE_RE = re.compile(r"[\s\"“”‘’`]+")
 
 
@@ -393,7 +392,6 @@ GENERIC_ROLE_SAID_RE = re.compile(
     re.IGNORECASE,
 )
 
-# IMPORTANT: stop at ANY quote mark so we don't cross a quoted title
 REPORTING_SPEAKER_BEFORE_RE = re.compile(
     rf"({NAME_PHRASE})\s*,?[^“”\"«»]{{0,240}}?\b(?:{ATTR_VERB_RE})\b",
     re.IGNORECASE,
@@ -410,7 +408,6 @@ OFFICE_SAID_RE = re.compile(
 )
 
 AFTER_ATTR_PATTERNS = [
-    # shared attribution after a second quote
     re.compile(
         rf'^\s*(?:and|or)\s+(?:an?\s+|the\s+)?[“"](?P<q2>.+?)[”"]\s*[,–—-]?\s*(?P<n>{NAME_PHRASE})\s+(?:{ATTR_VERB_RE})\b',
         re.IGNORECASE,
@@ -451,7 +448,6 @@ DOC_TITLE_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9&.\-']+(?:\s+[A-Z][A-Za-z0-9&.\-']+){0,10}\s+(?:Report|Study|Paper|Review|Analysis|Audit))\b"
 )
 
-
 def infer_document_title(context_before: str, context_after: str) -> Optional[str]:
     before = fast_context_norm(context_before)[-CTX_WINDOW:]
     after = fast_context_norm(context_after)[:CTX_WINDOW]
@@ -489,13 +485,17 @@ NON_NAME_SINGLETONS = {
     "immigration", "customs", "enforcement", "ice",
     "grammy", "grammys", "awards", "super", "bowl", "halftime", "show", "apple", "music",
     "calling", "saying", "asking", "warning", "noting", "adding", "explaining",
+    # NEW: time prepositions that can start "On Thursday"
+    "on",
 }
 
+# NEW: include "house" so "White House" gets rejected as a non-person phrase
 NON_PERSON_LAST_TOKENS = {
     "enforcement", "department", "agency", "administration", "committee", "council",
     "office", "university", "hospital", "ministry", "commission", "foundation",
     "organization", "organisation", "service", "services",
     "awards", "award", "show", "halftime", "performance", "language", "focus",
+    "house",
 }
 
 TITLE_PSEUDO_NAMES = {
@@ -504,12 +504,43 @@ TITLE_PSEUDO_NAMES = {
     "the actor", "the comedian", "the athlete", "the judge", "the court",
     "president", "vice president", "senator", "governor", "mayor", "speaker", "chair",
     "commissioner", "judge", "press secretary", "spokesperson",
+    # NEW: catch un-prefixed form too
+    "white house",
 }
 
 EVENT_PHRASES = {
     "grammy awards", "the grammy awards", "super bowl", "super bowl halftime show", "halftime show",
     "all american halftime show",
 }
+
+# NEW: reject "On Thursday"/"On Wednesday"/"On Feb. 20" style lead-ins as pseudo names
+_WEEKDAY_RE = re.compile(r"^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)$", re.IGNORECASE)
+_MONTH_RE = re.compile(
+    r"^(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?$",
+    re.IGNORECASE,
+)
+_ON_DATE_LEADIN_RE = re.compile(
+    r"^on\s+([A-Za-z]{3,9}|[A-Za-z]{3,9}\.\s+\d{1,2}|\d{1,2})\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_date_leadin(name: str) -> bool:
+    n = normalize_ws(name).strip()
+    low = n.lower()
+    if low.startswith("on "):
+        rest = low[3:].strip()
+        # "On Thursday"
+        if _WEEKDAY_RE.match(rest):
+            return True
+        # "On Wednesday afternoon" etc
+        first = rest.split()[0]
+        if _WEEKDAY_RE.match(first) or _MONTH_RE.match(first):
+            return True
+        # "On Feb. 20", "On Feb 20", "On 20"
+        if _ON_DATE_LEADIN_RE.match(low):
+            return True
+    return False
 
 
 def _is_non_person_name(name: str) -> bool:
@@ -536,6 +567,9 @@ def clean_author_candidate(a: str) -> Optional[str]:
     n = tidy_quote_text(a)
     n = PHOTO_CREDIT_TAIL_RE.sub("", n).strip()
     if not n:
+        return None
+
+    if _looks_like_date_leadin(n):
         return None
 
     low = n.lower().strip(".,;:!?")
@@ -625,7 +659,7 @@ def infer_nearest_name_in_before(before: str) -> Optional[str]:
     Search backward and SKIP rejected candidates.
     Avoid singleton tokens in "X and Y ...".
     Strip quoted segments to avoid pulling names from earlier quotes.
-    NEW: skip tokens that are objects of prepositions (at/to/for/of/from/with/against).
+    Skip tokens that are objects of prepositions (at/to/for/of/from/with/against).
     """
     b = normalize_ws(strip_quoted_segments(before))
     b_low = b.lower()
@@ -674,6 +708,22 @@ def _looks_like_quoted_title(before: str, quote: str) -> bool:
     return bool(re.search(r"\b(podcast|episode|show|series)\b", before, re.IGNORECASE))
 
 
+# NEW: if we already carried a full name, and we only inferred a prefix token, upgrade it
+def _upgrade_from_carry_if_prefix(author: str, carry: Optional[str]) -> str:
+    if not author or not carry:
+        return author
+    a = normalize_ws(author).strip()
+    c = normalize_ws(carry).strip()
+    if not c or " " not in c:
+        return author
+    if " " in a:
+        return author
+    # if "Karoline" and carry is "Karoline Leavitt" -> upgrade
+    if c.lower().startswith(a.lower() + " "):
+        return c
+    return author
+
+
 def resolve_author_for_quote(
     context_before: str,
     context_after: str,
@@ -681,11 +731,10 @@ def resolve_author_for_quote(
     lastname_map: Optional[Dict[str, str]],
     last_known_author_in_paragraph: Optional[str],
 ) -> Tuple[str, str]:
-    # Use full windows for general patterns...
     before_full = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
     after = scrub_attrib_context(fast_context_norm(context_after)[:CTX_WINDOW])
 
-    # ...but for spokesperson/office, only look at the most recent paragraph-ish segment
+    # local before: most recent paragraph-ish segment
     cb = context_before.replace("\r\n", "\n").replace("\r", "\n")
     cut = cb.rfind("\n\n")
     local_before_raw = cb[cut + 2:] if cut != -1 else cb
@@ -708,10 +757,10 @@ def resolve_author_for_quote(
         if who:
             return f"{who}'s office", "before_office"
 
-    # 0.25) Prefer reporting speaker in lead-in clause (news attribution)
-    # Search a version with quoted segments removed to handle: X said ... “q1” ... “q2”
+    # 0.25) Prefer reporting speaker in lead-in clause
     before_nq = strip_quoted_segments(before)
     reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before_nq))
+
     if reps:
         tail = before_local[-240:].lower()
         if "spokesperson for" in tail or "'s office" in tail:
@@ -720,6 +769,9 @@ def resolve_author_for_quote(
     if reps:
         cand = extract_best_person_name(reps[-1].group(1))
         cand = clean_author_candidate(cand or "")
+        if cand:
+            cand = _upgrade_from_carry_if_prefix(cand, last_known_author_in_paragraph)
+
         if cand and " " not in cand and _followed_by_and_cap(before, cand):
             cand = None
         if cand:
@@ -728,7 +780,7 @@ def resolve_author_for_quote(
                 return cand2, "before_reporting_speaker"
             return cand, "before_reporting_speaker"
 
-    # 0.5) Document voice (prefer over carry)
+    # 0.5) Document voice
     for pat in AFTER_DOC_ATTR_PATTERNS:
         m = pat.search(after)
         if m:
@@ -748,6 +800,7 @@ def resolve_author_for_quote(
     if PRONOUN_AFTER_RE.search(after):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
+            inferred = _upgrade_from_carry_if_prefix(inferred, last_known_author_in_paragraph)
             if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
                 inferred2 = clean_author_candidate(lastname_map[inferred]) or inferred
                 return inferred2, "after_pronoun"
@@ -756,6 +809,7 @@ def resolve_author_for_quote(
     if GENERIC_ROLE_SAID_RE.search(after) or GENERIC_ROLE_SAID_RE.search(before):
         inferred = infer_nearest_name_in_before(before)
         if inferred:
+            inferred = _upgrade_from_carry_if_prefix(inferred, last_known_author_in_paragraph)
             if lastname_map and len(inferred.split()) == 1 and inferred in lastname_map:
                 inferred2 = clean_author_candidate(lastname_map[inferred]) or inferred
                 return inferred2, "generic_role_infer"
@@ -778,6 +832,7 @@ def resolve_author_for_quote(
     if m_shared:
         name = extract_best_person_name(m_shared.group("n"))
         if name:
+            name = _upgrade_from_carry_if_prefix(name, last_known_author_in_paragraph)
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name2 = clean_author_candidate(lastname_map[name]) or name
                 return name2, "after_shared_name"
@@ -789,6 +844,7 @@ def resolve_author_for_quote(
             continue
         name = extract_best_person_name(m.group(1))
         if name:
+            name = _upgrade_from_carry_if_prefix(name, last_known_author_in_paragraph)
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name2 = clean_author_candidate(lastname_map[name]) or name
                 return name2, "after_name"
@@ -813,6 +869,7 @@ def resolve_author_for_quote(
             continue
         name = extract_best_person_name(m.group(1))
         if name:
+            name = _upgrade_from_carry_if_prefix(name, last_known_author_in_paragraph)
             if lastname_map and len(name.split()) == 1 and name in lastname_map:
                 name2 = clean_author_candidate(lastname_map[name]) or name
                 return name2, "before_name"
@@ -1088,6 +1145,8 @@ def ok_title_speaker(label: str) -> bool:
         return False
     if re.search(r"\d", l) and not re.search(r"\b(II|III|IV)\b", l):
         return False
+    if _looks_like_date_leadin(l):
+        return False
     return True
 
 
@@ -1246,7 +1305,7 @@ def extract_quotes(
                     if (s - a_pos) <= MAX_CARRY_DISTANCE:
                         between_norm = fast_context_norm(raw[a_pos:s]).lower()
                         competing = False
-                        if REPORTING_SPEAKER_BEFORE_RE.search(between_norm):
+                        if REPORTING_SPEAKER_BEFORE_RE.search(strip_quoted_segments(between_norm)):
                             competing = True
                         if re.search(rf"\b{NAME_PHRASE}\b\s+(?:{ATTR_VERB_RE})\b", between_norm, re.IGNORECASE):
                             competing = True
@@ -1345,32 +1404,6 @@ def extract_quotes(
             include_debug=include_debug,
         ):
             add_or_upgrade(r)
-
-    # Post-pass: attach Goodreads tags / attribution lines to nearest previous quote
-    results.sort(key=lambda x: int(x.get("_pos", 0)))
-    positions = [int(r.get("_pos", 0)) for r in results]
-
-    def prev_index(pos: int) -> Optional[int]:
-        j = bisect_right(positions, pos) - 1
-        return j if j >= 0 else None
-
-    for i, line in enumerate(raw.splitlines()):
-        pos = line_starts[i]
-        stripped = line.strip()
-
-        m_tags = GOODREADS_TAGS_RE.match(stripped)
-        if m_tags:
-            j = prev_index(pos)
-            if j is not None:
-                results[j]["tags"] = parse_tag_line(m_tags.group(1))
-
-        m_attr = ATTRIBUTION_LINE_RE.match(stripped)
-        if m_attr:
-            j = prev_index(pos)
-            if j is not None and str(results[j].get("author", default_author)) == default_author:
-                a = clean_author_candidate(m_attr.group(1))
-                if a:
-                    results[j]["author"] = a
 
     if include_debug:
         out_dbg: List[Dict[str, object]] = []
