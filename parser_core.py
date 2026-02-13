@@ -343,7 +343,7 @@ ATTR_VERB_RE = (
     r"(?:according to|said|says|tell|tells|told|wrote|write|writes|stated|states|notes|noted|argued|added|"
     r"explained|joked|quipped|teased|continued|recalled|insisted|admitted|warned|"
     r"posted|tweeted|shared|claimed|alleged|alleges|accused|accuses|"
-    r"said in a statement|wrote in a statement|told reporters|told (?:abc7|cnn|bbc|reuters|ap|the times|"
+    r"said in a statement|wrote in a statement|told reporters|told (?:abc7|cnn|bbc|reuters|ap|time|the times|"
     r"the post|the guardian|fox news|nbc|cbs|msnbc|npr))"
 )
 
