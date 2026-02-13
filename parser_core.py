@@ -324,13 +324,19 @@ def looks_like_headline(line: str) -> bool:
 # Attribution (names + verbs + orgs)
 # -----------------------------
 
-# UPDATED: allow internal-cap segments like McNeill, MacArthur, DeSantis
-NAME_WORD = r"[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+(?:[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+)*(?:[-'][A-ZÀ-ÖØ-Þa-zà-öø-ÿ]+)?"
+# base name word (fast)
+NAME_WORD = r"[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+(?:[-'][A-ZÀ-ÖØ-Þa-zà-öø-ÿ]+)?"
+
+# handle McNeill / MacArthur explicitly (fast, no star repetition)
+MC_WORD = r"(?:Mc|Mac)[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+"
+
 INITIALS = r"(?:[A-Z]\.){1,3}"
 PARTICLE = r"(?:de|del|da|di|la|le|van|von|der|den|du|st)\.?"
 SUFFIX = r"(?:Jr\.|Sr\.|II|III|IV)"
 
-NAME_TOKEN = rf"(?:{NAME_WORD}|{INITIALS})"
+# token is either regular name, Mc/Mac-name, or initials
+NAME_TOKEN = rf"(?:{NAME_WORD}|{MC_WORD}|{INITIALS})"
+
 NAME_PHRASE = rf"{NAME_TOKEN}(?:\s+(?:{PARTICLE}\s+)?{NAME_TOKEN}){{0,4}}(?:\s+{SUFFIX})?"
 
 FULLNAME_RE = re.compile(
