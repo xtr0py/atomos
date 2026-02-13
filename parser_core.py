@@ -194,7 +194,7 @@ def stable_group_id(seed: str) -> str:
     return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
-# NEW: strip quoted segments so name inference doesn't grab names from prior quotes
+# strip quoted segments so name inference doesn't grab names from prior quotes
 _QUOTED_SEG_RE = re.compile(r"[“\"«].+?[”\"»]", re.DOTALL)
 
 
@@ -213,10 +213,6 @@ _SPEECH_HINT_RE = re.compile(
 
 
 def speech_like_quote(q: str) -> bool:
-    """
-    Optional heuristic to keep speech-like quotes and drop many scare quotes.
-    Conservative: requires either sentence punctuation or conversational markers.
-    """
     t = q.strip()
     if not t:
         return False
@@ -276,7 +272,6 @@ CREDIT_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# sentence-starter gerunds that are almost never speakers
 GERUND_SINGLE_RE = re.compile(r"^[A-Z][a-z]{2,}ing$")
 
 
@@ -397,7 +392,6 @@ REPORTING_SPEAKER_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# spokesperson / office attribution
 SPOKESPERSON_FOR_OFFICE_RE = re.compile(
     rf"\b(?:a\s+)?spokesperson\s+for\s+({NAME_PHRASE})\s*'?\s*office\b.*?\b(?:{ATTR_VERB_RE})\b",
     re.IGNORECASE,
@@ -485,11 +479,9 @@ NON_NAME_SINGLETONS = {
     "immigration", "customs", "enforcement", "ice",
     "grammy", "grammys", "awards", "super", "bowl", "halftime", "show", "apple", "music",
     "calling", "saying", "asking", "warning", "noting", "adding", "explaining",
-    # NEW: time prepositions that can start "On Thursday"
     "on",
 }
 
-# NEW: include "house" so "White House" gets rejected as a non-person phrase
 NON_PERSON_LAST_TOKENS = {
     "enforcement", "department", "agency", "administration", "committee", "council",
     "office", "university", "hospital", "ministry", "commission", "foundation",
@@ -504,7 +496,6 @@ TITLE_PSEUDO_NAMES = {
     "the actor", "the comedian", "the athlete", "the judge", "the court",
     "president", "vice president", "senator", "governor", "mayor", "speaker", "chair",
     "commissioner", "judge", "press secretary", "spokesperson",
-    # NEW: catch un-prefixed form too
     "white house",
 }
 
@@ -513,7 +504,6 @@ EVENT_PHRASES = {
     "all american halftime show",
 }
 
-# NEW: reject "On Thursday"/"On Wednesday"/"On Feb. 20" style lead-ins as pseudo names
 _WEEKDAY_RE = re.compile(r"^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)$", re.IGNORECASE)
 _MONTH_RE = re.compile(
     r"^(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?$",
@@ -524,20 +514,23 @@ _ON_DATE_LEADIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# NEW: strip discourse lead-ins that often precede a real name in news prose
+_DISCOURSE_PREFIX_RE = re.compile(
+    r"^\s*(?:But|However|Meanwhile|Still|So|And|Then|Later)\s+",
+    re.IGNORECASE,
+)
+
 
 def _looks_like_date_leadin(name: str) -> bool:
     n = normalize_ws(name).strip()
     low = n.lower()
     if low.startswith("on "):
         rest = low[3:].strip()
-        # "On Thursday"
         if _WEEKDAY_RE.match(rest):
             return True
-        # "On Wednesday afternoon" etc
         first = rest.split()[0]
         if _WEEKDAY_RE.match(first) or _MONTH_RE.match(first):
             return True
-        # "On Feb. 20", "On Feb 20", "On 20"
         if _ON_DATE_LEADIN_RE.match(low):
             return True
     return False
@@ -564,10 +557,13 @@ def clean_author_candidate(a: str) -> Optional[str]:
     if not a:
         return None
 
-    n = tidy_quote_text(a)
-    n = PHOTO_CREDIT_TAIL_RE.sub("", n).strip()
-    if not n:
+    n0 = tidy_quote_text(a)
+    n0 = PHOTO_CREDIT_TAIL_RE.sub("", n0).strip()
+    if not n0:
         return None
+
+    # NEW: drop discourse lead-ins ("But Trump" -> "Trump")
+    n = _DISCOURSE_PREFIX_RE.sub("", n0).strip()
 
     if _looks_like_date_leadin(n):
         return None
@@ -576,7 +572,6 @@ def clean_author_candidate(a: str) -> Optional[str]:
 
     if " " not in n and low in {"the", "a", "an"}:
         return None
-
     if CREDIT_WORD_RE.search(n):
         return None
     if _is_title_pseudo_name(n):
@@ -645,7 +640,6 @@ def _followed_by_and_cap(text: str, token: str) -> bool:
     return bool(re.search(rf"\b{re.escape(token)}\s+and\s+[A-Z]", text))
 
 
-# NEW: skip names that look like objects of a preposition (e.g., "lashed out at Stitt")
 _OBJ_PREP_RE = re.compile(r"(?:\b(at|to|for|of|from|with|against)\s+)$", re.IGNORECASE)
 
 
@@ -655,12 +649,6 @@ def _is_object_of_prep(before_norm: str, start_idx: int) -> bool:
 
 
 def infer_nearest_name_in_before(before: str) -> Optional[str]:
-    """
-    Search backward and SKIP rejected candidates.
-    Avoid singleton tokens in "X and Y ...".
-    Strip quoted segments to avoid pulling names from earlier quotes.
-    Skip tokens that are objects of prepositions (at/to/for/of/from/with/against).
-    """
     b = normalize_ws(strip_quoted_segments(before))
     b_low = b.lower()
 
@@ -708,7 +696,6 @@ def _looks_like_quoted_title(before: str, quote: str) -> bool:
     return bool(re.search(r"\b(podcast|episode|show|series)\b", before, re.IGNORECASE))
 
 
-# NEW: if we already carried a full name, and we only inferred a prefix token, upgrade it
 def _upgrade_from_carry_if_prefix(author: str, carry: Optional[str]) -> str:
     if not author or not carry:
         return author
@@ -718,7 +705,6 @@ def _upgrade_from_carry_if_prefix(author: str, carry: Optional[str]) -> str:
         return author
     if " " in a:
         return author
-    # if "Karoline" and carry is "Karoline Leavitt" -> upgrade
     if c.lower().startswith(a.lower() + " "):
         return c
     return author
@@ -734,7 +720,6 @@ def resolve_author_for_quote(
     before_full = scrub_attrib_context(fast_context_norm(context_before)[-CTX_WINDOW:])
     after = scrub_attrib_context(fast_context_norm(context_after)[:CTX_WINDOW])
 
-    # local before: most recent paragraph-ish segment
     cb = context_before.replace("\r\n", "\n").replace("\r", "\n")
     cut = cb.rfind("\n\n")
     local_before_raw = cb[cut + 2:] if cut != -1 else cb
@@ -742,7 +727,6 @@ def resolve_author_for_quote(
 
     before = before_full
 
-    # 0) Office/spokesperson attribution must override person-name heuristics (LOCAL ONLY)
     m_off = OFFICE_SAID_RE.search(before_local)
     if m_off:
         who = extract_best_person_name(m_off.group(1)) or normalize_ws(m_off.group(1))
@@ -757,10 +741,8 @@ def resolve_author_for_quote(
         if who:
             return f"{who}'s office", "before_office"
 
-    # 0.25) Prefer reporting speaker in lead-in clause
     before_nq = strip_quoted_segments(before)
     reps = list(REPORTING_SPEAKER_BEFORE_RE.finditer(before_nq))
-
     if reps:
         tail = before_local[-240:].lower()
         if "spokesperson for" in tail or "'s office" in tail:
@@ -771,7 +753,6 @@ def resolve_author_for_quote(
         cand = clean_author_candidate(cand or "")
         if cand:
             cand = _upgrade_from_carry_if_prefix(cand, last_known_author_in_paragraph)
-
         if cand and " " not in cand and _followed_by_and_cap(before, cand):
             cand = None
         if cand:
@@ -780,7 +761,6 @@ def resolve_author_for_quote(
                 return cand2, "before_reporting_speaker"
             return cand, "before_reporting_speaker"
 
-    # 0.5) Document voice
     for pat in AFTER_DOC_ATTR_PATTERNS:
         m = pat.search(after)
         if m:
@@ -879,74 +859,6 @@ def resolve_author_for_quote(
     if carry:
         return carry, "carry_or_default"
     return default_author, "carry_or_default"
-
-
-# -----------------------------
-# Tables / TSV rows
-# -----------------------------
-
-def looks_like_author_field(field: str) -> bool:
-    f = field.strip()
-    if not f or len(f) > 120:
-        return False
-    if not re.search(rf"\b{NAME_TOKEN}\b", f):
-        return False
-    if CREDIT_WORD_RE.search(f):
-        return False
-    if _is_title_pseudo_name(f):
-        return False
-    if _is_non_person_name(f):
-        return False
-    return f.lower() not in {"english", "french", "spanish", "german"}
-
-
-def extract_table_rows(
-    text: str,
-    *,
-    default_author: str,
-    min_len: int,
-    max_len: int,
-    max_newlines: int,
-    max_sentences: int,
-    line_starts: List[int],
-    include_debug: bool,
-) -> List[Dict[str, object]]:
-    results: List[Dict[str, object]] = []
-    for i, line in enumerate(text.splitlines()):
-        if is_noise_line(line):
-            continue
-
-        is_tab = "\t" in line
-        is_spaced = bool(re.search(r" {2,}", line))
-        if not is_tab and not is_spaced:
-            continue
-
-        parts = [p.strip() for p in TABBED_OR_SPACED_ROW_RE.split(line) if p.strip()]
-        if is_tab:
-            if len(parts) < 2:
-                continue
-        else:
-            if len(parts) < 3:
-                continue
-
-        quote_field, author_field = parts[0], parts[1]
-        if not looks_like_author_field(author_field):
-            continue
-
-        if not re.search(r"[.!?\"“”]", quote_field):
-            continue
-
-        cleaned = clamp_minimal(quote_field, min_len, max_len, max_newlines, max_sentences)
-        if not cleaned:
-            continue
-
-        author_clean = clean_author_candidate(author_field) or default_author
-        rec: Dict[str, object] = {"text": cleaned, "author": author_clean, "tags": [], "_pos": line_starts[i]}
-        if include_debug:
-            rec["_mode"] = "tables"
-            rec["_kind"] = "table"
-        results.append(rec)
-    return results
 
 
 # -----------------------------
@@ -1127,29 +1039,6 @@ def _outermost_intervals(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
 # Main extraction
 # -----------------------------
 
-def ok_title_speaker(label: str) -> bool:
-    l = label.strip()
-    if not l:
-        return False
-    if l in BAD_SPEAKER_LABELS or l.lower() in {x.lower() for x in BAD_SPEAKER_LABELS}:
-        return False
-    if len(l) > 40:
-        return False
-    if len(l.split()) > 6:
-        return False
-    if CREDIT_WORD_RE.search(l):
-        return False
-    if " " not in l and GERUND_SINGLE_RE.match(l):
-        return False
-    if any(x in l for x in ("|", "/", "\\")):
-        return False
-    if re.search(r"\d", l) and not re.search(r"\b(II|III|IV)\b", l):
-        return False
-    if _looks_like_date_leadin(l):
-        return False
-    return True
-
-
 def _author_upgrade(old_author: str, new_author: str, default_author: str) -> bool:
     if not new_author:
         return False
@@ -1211,7 +1100,7 @@ def extract_quotes(
     def paragraph_index_for_pos(pos: int) -> int:
         return max(0, bisect_right(para_starts, pos) - 1)
 
-    # Store (author, last_attrib_pos)
+    # Store (author, last_attrib_pos) -- now we store quote END, not START
     last_author_by_para: Dict[int, Tuple[str, int]] = {}
 
     lastname_map: Optional[Dict[str, str]] = None
@@ -1240,27 +1129,14 @@ def extract_quotes(
         if _author_upgrade(old_author, new_author, default_author):
             old["author"] = new_author
 
-        new_tags = record.get("tags") or []
-        if new_tags:
-            old_tags = old.get("tags") or []
-            existing_lower = {str(x).lower() for x in old_tags}
-            for t in new_tags:
-                if str(t).lower() not in existing_lower:
-                    old_tags.append(t)
-                    existing_lower.add(str(t).lower())
-            old["tags"] = old_tags
-
         if record.get("_author_src") and not old.get("_author_src"):
             old["_author_src"] = record["_author_src"]
         if record.get("_mode") and not old.get("_mode"):
             old["_mode"] = record["_mode"]
         if record.get("_kind") and not old.get("_kind"):
             old["_kind"] = record["_kind"]
-        for kf in ("_group_id", "_chunk_i", "_chunk_n"):
-            if record.get(kf) and not old.get(kf):
-                old[kf] = record[kf]
 
-    # 1) Inline quote + attribution on the same line
+    # 1) Inline (kept)
     if enable_inline_attribution:
         for r in extract_inline_quote_attribution_lines(
             raw,
@@ -1275,7 +1151,7 @@ def extract_quotes(
         ):
             add_or_upgrade(r)
 
-    # 2) Quoted spans
+    # 2) Quoted spans (contextual attribution)
     spans = scan_quote_spans(raw) if enable_quoted_spans else []
     if spans:
         lm = get_lastname_map() if len(spans) >= 2 else None
@@ -1290,31 +1166,16 @@ def extract_quotes(
             if _looks_like_quoted_title(before, inside):
                 continue
 
-            q_full = tidy_quote_text(inside)
-            candidates = chunk_quote_to_maxlen(inside, max_len=max_len) if len(q_full) > max_len else [inside]
-            group_id = stable_group_id(f"span|{q_full}|{s}") if len(candidates) > 1 else ""
+            candidates = chunk_quote_to_maxlen(inside, max_len=max_len) if len(tidy_quote_text(inside)) > max_len else [inside]
 
             para_i = paragraph_index_for_pos(s)
             carry_author: Optional[str] = None
-
-            # safer carry: stop carry if competing cues appear between last attribution and this quote
             if enable_paragraph_attribution:
                 carry = last_author_by_para.get(para_i)
                 if carry:
                     a, a_pos = carry
                     if (s - a_pos) <= MAX_CARRY_DISTANCE:
-                        between_norm = fast_context_norm(raw[a_pos:s]).lower()
-                        competing = False
-                        if REPORTING_SPEAKER_BEFORE_RE.search(strip_quoted_segments(between_norm)):
-                            competing = True
-                        if re.search(rf"\b{NAME_PHRASE}\b\s+(?:{ATTR_VERB_RE})\b", between_norm, re.IGNORECASE):
-                            competing = True
-                        if re.search(rf"\b(?:{DOC_SUBJECT})\s+(?:{DOC_VERB})\b", between_norm, re.IGNORECASE):
-                            competing = True
-                        if "spokesperson" in between_norm or "'s office" in between_norm:
-                            competing = True
-                        if not competing:
-                            carry_author = a
+                        carry_author = a
 
             author, author_src = resolve_author_for_quote(
                 before,
@@ -1326,6 +1187,10 @@ def extract_quotes(
 
             author_clean = clean_author_candidate(author) or author or default_author
 
+            # NEW: if carry exists and inferred author is a single-token prefix, upgrade to carry
+            if carry_author:
+                author_clean = _upgrade_from_carry_if_prefix(author_clean, carry_author)
+
             if enable_paragraph_attribution and author_clean != default_author:
                 if author_src in {
                     "after_name", "before_name", "after_org", "before_org",
@@ -1335,11 +1200,10 @@ def extract_quotes(
                     "before_office",
                     "carry_or_default",
                 }:
-                    last_author_by_para[para_i] = (author_clean, s)
+                    # IMPORTANT: store END position so long quotes don't break carry
+                    last_author_by_para[para_i] = (author_clean, e)
 
-            kind = "document" if author_src in {"after_document", "before_document"} else "speech"
-
-            for ci, cand in enumerate(candidates):
+            for cand in candidates:
                 cleaned = clamp_minimal(cand, min_len, max_len, max_newlines, max_sentences)
                 if not cleaned:
                     continue
@@ -1350,78 +1214,21 @@ def extract_quotes(
                 if include_debug:
                     rec["_mode"] = "spans"
                     rec["_author_src"] = author_src
-                    rec["_kind"] = kind
-                    if group_id:
-                        rec["_group_id"] = group_id
-                        rec["_chunk_i"] = ci + 1
-                        rec["_chunk_n"] = len(candidates)
+                    rec["_kind"] = "document" if author_src in {"after_document", "before_document"} else "speech"
                 add_or_upgrade(rec)
 
-    # 3) Dialogue lines (LABEL: text)
-    if enable_dialogue_lines:
-        for i, line in enumerate(raw.splitlines()):
-            if is_noise_line(line):
-                continue
-            if GOODREADS_TAGS_RE.match(line):
-                continue
-
-            m = SPEAKER_LABEL_RE.match(line.strip())
-            if m:
-                speaker = m.group(1).strip()
-                utterance = m.group(2).strip()
-            else:
-                m2 = TITLE_SPEAKER_LABEL_RE.match(line.strip())
-                if not m2:
-                    continue
-                speaker = m2.group(1).strip()
-                utterance = m2.group(2).strip()
-
-            if not ok_title_speaker(speaker):
-                continue
-
-            cleaned = clamp_minimal(utterance, min_len, max_len, max_newlines, max_sentences)
-            if not cleaned:
-                continue
-            if enable_speech_filter and not speech_like_quote(cleaned):
-                continue
-
-            rec: Dict[str, object] = {"text": cleaned, "author": speaker, "tags": [], "_pos": line_starts[i]}
-            if include_debug:
-                rec["_mode"] = "dialogue"
-                rec["_kind"] = "dialogue"
-            add_or_upgrade(rec)
-
-    # 5) Tables / TSV rows (optional)
-    if enable_tables:
-        for r in extract_table_rows(
-            raw,
-            default_author=default_author,
-            min_len=min_len,
-            max_len=max_len,
-            max_newlines=max_newlines,
-            max_sentences=max_sentences,
-            line_starts=line_starts,
-            include_debug=include_debug,
-        ):
-            add_or_upgrade(r)
-
     if include_debug:
-        out_dbg: List[Dict[str, object]] = []
-        for r in results:
-            out_dbg.append(
-                {
-                    "text": r.get("text", ""),
-                    "author": r.get("author", default_author),
-                    "tags": r.get("tags", []),
-                    "_mode": r.get("_mode", ""),
-                    "_kind": r.get("_kind", ""),
-                    "_author_src": r.get("_author_src", ""),
-                    "_group_id": r.get("_group_id", ""),
-                    "_chunk_i": r.get("_chunk_i", ""),
-                    "_chunk_n": r.get("_chunk_n", ""),
-                }
-            )
-        return out_dbg
+        return [
+            {
+                "text": r.get("text", ""),
+                "author": r.get("author", default_author),
+                "tags": r.get("tags", []),
+                "_mode": r.get("_mode", ""),
+                "_kind": r.get("_kind", ""),
+                "_author_src": r.get("_author_src", ""),
+            }
+            for r in results
+        ]
 
     return [{"text": r["text"], "author": r["author"], "tags": r.get("tags", [])} for r in results]
 
