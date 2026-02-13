@@ -9,7 +9,7 @@ import streamlit as st
 
 from parser_core import (
     extract_quotes,
-    normalize_key,     # now unified with dataset_key in parser_core
+    normalize_key,  # unified with dataset_key in parser_core
     parse_tag_line,
     DEFAULT_MIN_LEN,
     DEFAULT_MAX_LEN,
@@ -100,6 +100,7 @@ PRESET_LONG_HELP: Dict[str, str] = {
         "Use when none of the presets fit your input, or when you want full manual control over parsing behavior.",
 }
 
+# Toggle presets (same as before)
 PRESETS: Dict[str, Dict[str, bool]] = {
     "📰 News article (recommended)": {
         "enable_inline_attribution": True,
@@ -140,11 +141,51 @@ PRESETS: Dict[str, Dict[str, bool]] = {
     "⚙ Custom": {},
 }
 
+# NEW: numeric presets so quote pages can capture short quotes (e.g., "Hope is not a strategy.")
+PRESET_NUMERIC_DEFAULTS: Dict[str, Dict[str, int]] = {
+    "📰 News article (recommended)": {
+        "min_len": int(DEFAULT_MIN_LEN),
+        "max_len": int(DEFAULT_MAX_LEN),
+        "max_newlines": int(DEFAULT_MAX_NEWLINES),
+        "max_sentences": int(DEFAULT_MAX_SENTENCES),
+    },
+    "🎙 Transcript / Interview": {
+        "min_len": 20,
+        "max_len": int(DEFAULT_MAX_LEN),
+        "max_newlines": int(DEFAULT_MAX_NEWLINES),
+        "max_sentences": int(DEFAULT_MAX_SENTENCES),
+    },
+    "📜 Curated quote list (quote pages / Goodreads)": {
+        "min_len": 8,          # <— key change
+        "max_len": int(DEFAULT_MAX_LEN),
+        "max_newlines": int(DEFAULT_MAX_NEWLINES),
+        "max_sentences": 10,   # quote pages often have 1–2 longer sentences
+    },
+    "📊 Table import (quote + author columns)": {
+        "min_len": 1,
+        "max_len": int(DEFAULT_MAX_LEN),
+        "max_newlines": int(DEFAULT_MAX_NEWLINES),
+        "max_sentences": 12,
+    },
+    "⚙ Custom": {},
+}
+
 def apply_preset(preset_name: str) -> None:
+    """
+    Applies BOTH toggle presets and numeric presets into session_state.
+    Custom does nothing.
+    """
     if preset_name not in PRESETS or preset_name == "⚙ Custom":
         return
+
+    # toggles
     cfg = PRESETS[preset_name]
     for k, v in cfg.items():
+        st.session_state[k] = v
+
+    # numeric defaults
+    nums = PRESET_NUMERIC_DEFAULTS.get(preset_name, {})
+    for k, v in nums.items():
         st.session_state[k] = v
 
 def preset_tooltip_text() -> str:
@@ -154,6 +195,13 @@ def preset_tooltip_text() -> str:
     for name in PRESET_ORDER:
         lines.append(f"{name}")
         lines.append(PRESET_LONG_HELP.get(name, "").strip())
+        # show numeric diffs where it matters
+        if name in PRESET_NUMERIC_DEFAULTS and PRESET_NUMERIC_DEFAULTS[name]:
+            nn = PRESET_NUMERIC_DEFAULTS[name]
+            lines.append(f"(Defaults: min_len={nn.get('min_len', DEFAULT_MIN_LEN)}, "
+                         f"max_len={nn.get('max_len', DEFAULT_MAX_LEN)}, "
+                         f"max_sentences={nn.get('max_sentences', DEFAULT_MAX_SENTENCES)}, "
+                         f"max_newlines={nn.get('max_newlines', DEFAULT_MAX_NEWLINES)})")
         lines.append("")
     lines.append("Tip: Choose Custom to manually control all toggles.")
     return "\n".join(lines).strip()
@@ -245,6 +293,7 @@ with st.sidebar:
         help=preset_tooltip_text(),
     )
 
+    # Apply preset on first load + on change
     if "preset_last" not in st.session_state:
         st.session_state["preset_last"] = preset
         apply_preset(preset)
@@ -252,19 +301,41 @@ with st.sidebar:
         st.session_state["preset_last"] = preset
         apply_preset(preset)
 
+    # Use session_state-backed numeric defaults (so presets can change them)
     st.subheader("Minimal quote filters")
-    min_len = st.number_input("Min length", min_value=1, max_value=500, value=int(DEFAULT_MIN_LEN))
+
+    min_len = st.number_input(
+        "Min length",
+        min_value=1,
+        max_value=500,
+        value=int(st.session_state.get("min_len", int(DEFAULT_MIN_LEN))),
+        key="min_len",
+    )
 
     max_len = st.number_input(
         "Max length",
         min_value=30,
         max_value=500,
-        value=int(DEFAULT_MAX_LEN),
+        value=int(st.session_state.get("max_len", int(DEFAULT_MAX_LEN))),
         help="Upper bound for extracted quote text. Long quotes are chunked when possible.",
+        key="max_len",
     )
 
-    max_sentences = st.number_input("Max sentences", min_value=1, max_value=20, value=int(DEFAULT_MAX_SENTENCES))
-    max_newlines = st.number_input("Max newlines", min_value=0, max_value=10, value=int(DEFAULT_MAX_NEWLINES))
+    max_sentences = st.number_input(
+        "Max sentences",
+        min_value=1,
+        max_value=50,
+        value=int(st.session_state.get("max_sentences", int(DEFAULT_MAX_SENTENCES))),
+        key="max_sentences",
+    )
+
+    max_newlines = st.number_input(
+        "Max newlines",
+        min_value=0,
+        max_value=10,
+        value=int(st.session_state.get("max_newlines", int(DEFAULT_MAX_NEWLINES))),
+        key="max_newlines",
+    )
 
     st.subheader("Basic modes")
 
@@ -320,7 +391,7 @@ with st.sidebar:
     st.subheader("Tag helpers")
     global_tags = st.text_input("Global tags (comma-separated, applied on save)", value="")
 
-# Keep session_state in sync
+# Keep session_state in sync (toggles)
 st.session_state["enable_inline_attribution"] = bool(enable_inline_attribution)
 st.session_state["enable_quoted_spans"] = bool(enable_quoted_spans)
 st.session_state["enable_speech_filter"] = bool(enable_speech_filter)
@@ -362,10 +433,10 @@ if parse_clicked:
     st.session_state["rows"] = cached_parse(
         source_text=source_text,
         default_author=default_author,
-        min_len=int(min_len),
-        max_len=int(max_len),
-        max_newlines=int(max_newlines),
-        max_sentences=int(max_sentences),
+        min_len=int(st.session_state.get("min_len", int(DEFAULT_MIN_LEN))),
+        max_len=int(st.session_state.get("max_len", int(DEFAULT_MAX_LEN))),
+        max_newlines=int(st.session_state.get("max_newlines", int(DEFAULT_MAX_NEWLINES))),
+        max_sentences=int(st.session_state.get("max_sentences", int(DEFAULT_MAX_SENTENCES))),
         enable_inline_attribution=bool(enable_inline_attribution),
         enable_quoted_spans=bool(enable_quoted_spans),
         enable_dialogue_lines=bool(enable_dialogue_lines),
@@ -416,7 +487,7 @@ if include_debug:
 
 edited = st.data_editor(
     df,
-    width='stretch',
+    width="stretch",
     num_rows="fixed",
     column_config=column_config,
 )
